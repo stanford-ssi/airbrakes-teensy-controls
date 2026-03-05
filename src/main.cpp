@@ -13,11 +13,12 @@
 I2CSlave i2c(0x42);
 UKF1D ukf;
 AirbrakeController controller;
-
+const int POTENTIOMETER_OUT_PIN = A13; // pin 27
 uint32_t last_time_ms = 0;
 uint32_t loop_count = 0;
 
-void setup() {
+void setup()
+{
     Serial.begin(115200);
     delay(500);
     Serial.println("Airbrake Controller Teensy 4.1");
@@ -37,30 +38,57 @@ void setup() {
     i2c.setCommand(cmd);
 }
 
-void loop() {
-    if (!i2c.hasNewPacket()) return;
+void loop()
+{
+    static uint32_t last_heartbeat = 0;
+    if (millis() - last_heartbeat >= 1000)
+    {
+        last_heartbeat = millis();
+        Serial.print("[heartbeat] t=");
+        Serial.print(millis());
+        Serial.print(" packets=");
+        Serial.print(loop_count);
+        Serial.print(" i2c_ready=");
+        Serial.println(i2c.hasNewPacket() ? "yes" : "no");
+    }
+
+    int potentiometer_value = analogRead(POTENTIOMETER_OUT_PIN);
+
+    if (!i2c.hasNewPacket())
+        return;
+
+    Serial.print("Packet #");
+    Serial.print(loop_count + 1);
+    Serial.print(" received at t=");
+    Serial.println(millis());
 
     ControlPacket pkt = i2c.getPacket();
 
     // Validate CRC
     uint8_t expected_crc = computeCRC((const uint8_t *)&pkt, sizeof(pkt) - 1);
-    if (pkt.crc != expected_crc) {
+    if (pkt.crc != expected_crc)
+    {
         Serial.println("CRC mismatch, dropping packet");
         return;
     }
 
     // Compute dt
     float dt;
-    if (last_time_ms == 0) {
+    if (last_time_ms == 0)
+    {
         dt = 0.05f; // Assume 50ms on first packet
-    } else {
+    }
+    else
+    {
         dt = (pkt.time_ms - last_time_ms) / 1000.0f;
-        if (dt <= 0.0f || dt > 1.0f) dt = 0.05f; // Sanity check
+        if (dt <= 0.0f || dt > 1.0f)
+            dt = 0.05f; // Sanity check
     }
     last_time_ms = pkt.time_ms;
 
     // Initialize UKF on first valid packet
-    if (!ukf.isInitialized()) {
+    if (!ukf.isInitialized())
+    {
         ukf.init(pkt.baro_altitude, 0.0f, 0.0f);
         Serial.print("UKF initialized at alt=");
         Serial.println(pkt.baro_altitude);
@@ -100,12 +128,14 @@ void loop() {
     cmd.cd_add_cmd = cd_add;
     cmd.predicted_apogee = controller.predictedApogee();
     cmd.controller_state = static_cast<uint8_t>(controller.controllerState());
+    cmd.potentiometer_value = potentiometer_value;
     cmd.crc = computeCRC((const uint8_t *)&cmd, sizeof(cmd) - 1);
 
     i2c.setCommand(cmd);
 
     // Debug output every 10 packets (~500ms)
-    if (++loop_count % 10 == 0) {
+    if (++loop_count % 10 == 0)
+    {
         Serial.print("t=");
         Serial.print(pkt.time_ms);
         Serial.print(" alt=");
@@ -122,5 +152,7 @@ void loop() {
         Serial.print(angles.angle_1, 1);
         Serial.print(" st=");
         Serial.println(pkt.flight_state);
+        Serial.print(" pot=");
+        Serial.println(potentiometer_value);
     }
 }
