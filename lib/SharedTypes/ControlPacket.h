@@ -16,7 +16,7 @@ struct ControlPacket
     uint8_t crc;          // 1 byte
 } __attribute__((packed));
 
-// CommandPacket: Teensy → STM32 (18 bytes)
+// CommandPacket: Teensy → STM32 (18 bytes → 16 bytes after potentiometer removal)
 // Served by Teensy slave via I2C onRequest (STM32 calls requestFrom)
 struct CommandPacket
 {
@@ -25,7 +25,6 @@ struct CommandPacket
     float cd_add_cmd;             // 4 bytes (additional Cd commanded)
     float predicted_apogee;       // 4 bytes (meters AGL)
     uint8_t controller_state;     // 1 byte (0=idle, 1=active, 2=retracted, 3=full)
-    uint16_t potentiometer_value; // 2 bytes (0-1023)
     uint8_t crc;                  // 1 byte
 } __attribute__((packed));
 

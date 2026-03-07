@@ -4,10 +4,10 @@ namespace RocketConfig {
     // Mass properties
     constexpr float MASS_KG = 18.9f;
 
-    // Aerodynamic properties
-    constexpr float BODY_CD = 0.7f;         // Body drag coefficient (no airbrakes)
-    constexpr float MAX_CD = 1.7f;          // Maximum total Cd (full airbrakes)
-    constexpr float MAX_CD_ADD = MAX_CD - BODY_CD;  // Max additional Cd from airbrakes
+    // Aerodynamic properties (from CFD LookupTableV1.csv)
+    constexpr float BODY_CD = 0.53f;        // Body drag coefficient at angle=1° (~Mach 0.45)
+    constexpr float MAX_CD = 2.01f;         // Maximum total Cd (angle=95°, Mach 0.8)
+    constexpr float MAX_CD_ADD = MAX_CD - BODY_CD;  // Max additional Cd from airbrakes (~1.48)
     constexpr float REF_AREA_M2 = 0.008107f; // Reference cross-section area
 
     // Target altitude

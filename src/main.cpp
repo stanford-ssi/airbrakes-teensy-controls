@@ -13,7 +13,6 @@
 I2CSlave i2c(0x42);
 UKF1D ukf;
 AirbrakeController controller;
-const int POTENTIOMETER_OUT_PIN = A13; // pin 27
 uint32_t last_time_ms = 0;
 uint32_t loop_count = 0;
 
@@ -51,8 +50,6 @@ void loop()
         Serial.print(" i2c_ready=");
         Serial.println(i2c.hasNewPacket() ? "yes" : "no");
     }
-
-    int potentiometer_value = analogRead(POTENTIOMETER_OUT_PIN);
 
     if (!i2c.hasNewPacket())
         return;
@@ -118,8 +115,9 @@ void loop()
         ukf.altitude(), ukf.velocity(), ukf.acceleration(),
         pkt.flight_state, sos, time_s, dt);
 
-    // Convert Cd to servo angles
-    ServoAngles angles = CdLookup::cdToServoAngles(cd_add);
+    // Convert Cd to servo angles using current Mach
+    float mach = fabsf(ukf.velocity()) / sos;
+    ServoAngles angles = CdLookup::cdToServoAngles(cd_add, mach);
 
     // Build command packet
     CommandPacket cmd;
@@ -128,7 +126,6 @@ void loop()
     cmd.cd_add_cmd = cd_add;
     cmd.predicted_apogee = controller.predictedApogee();
     cmd.controller_state = static_cast<uint8_t>(controller.controllerState());
-    cmd.potentiometer_value = potentiometer_value;
     cmd.crc = computeCRC((const uint8_t *)&cmd, sizeof(cmd) - 1);
 
     i2c.setCommand(cmd);
@@ -152,7 +149,5 @@ void loop()
         Serial.print(angles.angle_1, 1);
         Serial.print(" st=");
         Serial.println(pkt.flight_state);
-        Serial.print(" pot=");
-        Serial.println(potentiometer_value);
     }
 }
