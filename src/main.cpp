@@ -14,9 +14,16 @@
 #include <sensor_drivers/BNO.h>
 #include <sensor_drivers/Lps22.h>
 
-#define SIMULATION_MODE 0
+#define SIMULATION_MODE 1
 #define USE_BNO080 0
 #define USE_TELEMETRY 0
+
+#if SIMULATION_MODE
+#include <Atmosphere.h>
+#include <AirbrakeController.h>
+#include <CdLookup.h>
+#include <RocketConfig.h>
+#endif
 
 // Sensors
 Adxl adxl345 = Adxl(0x1D, ADXL345);
@@ -34,6 +41,10 @@ Igniter backupIgniter = Igniter(PinDefs.IGNITER_1, PinDefs.IGNITER_SENSE_1);
 Logging logging(DEBUG_MODE, true, PinDefs.SD_CS);
 StatusIndicator statusIndicator =
     StatusIndicator(PinDefs.STATUS_LED_RED, PinDefs.STATUS_LED_GREEN, PinDefs.STATUS_LED_BLUE);
+
+#if SIMULATION_MODE
+AirbrakeController airbrakeController;
+#endif
 
 // Shared state
 SensorData_t sensors;
@@ -91,16 +102,15 @@ static bool initSensor(T &sensor, const char *name, int maxAttempts = 10) {
 }
 
 static float altitudeDelta(float p, float T) {
-#if SIMULATION_MODE
-  float p_ref = SIM_PRESSURE_REF;
-  float T_ref = SIM_TEMPERATURE_REF;
-#else
   float p_ref = RefCalibration.pressure;
   float T_ref = RefCalibration.temperature;
-#endif
   float Tbar = 0.5f * (T_ref + T);
   return (Rd * Tbar / g0) * log(p_ref / p);
 }
+
+static bool simCalibrated = false;
+static int simCalibrationCount = 0;
+static const int SIM_CAL_SAMPLES = 10;
 
 static float readSensors() {
 #if SIMULATION_MODE
@@ -111,22 +121,37 @@ static float readSensors() {
 
   float values[6];
   int index = 0;
-  // this is fine cuz it's singlethreaded but like erm
   char *tok = strtok(buf, ",");
   while (tok && index < 6) {
     values[index++] = strtof(tok, nullptr);
     tok = strtok(nullptr, ",");
   }
 
-  if (index >= 6) {
-    sensors.accel_x = values[1];
-    sensors.accel_y = values[2];
-    sensors.accel_z = values[3];
-    sensors.pressure = values[4];
-    sensors.temperature = values[5];
-    sensors.accel_x_high_g = sensors.accel_x;
-    sensors.accel_y_high_g = sensors.accel_y;
-    sensors.accel_z_high_g = sensors.accel_z;
+  if (index < 6 || values[4] <= 0.0f) {
+    return NAN;  // no response or invalid pressure — skip this cycle
+  }
+
+  sensors.accel_x = values[1];
+  sensors.accel_y = values[2];
+  sensors.accel_z = values[3];
+  sensors.pressure = values[4];
+  sensors.temperature = values[5];
+  sensors.accel_x_high_g = sensors.accel_x;
+  sensors.accel_y_high_g = sensors.accel_y;
+  sensors.accel_z_high_g = sensors.accel_z;
+
+  // Calibrate ground-level reference from first valid SHITL readings
+  if (!simCalibrated) {
+    RefCalibration.pressure += sensors.pressure;
+    RefCalibration.temperature += sensors.temperature + CELSIUS_TO_KELVIN;
+    simCalibrationCount++;
+    if (simCalibrationCount >= SIM_CAL_SAMPLES) {
+      RefCalibration.pressure /= (float)SIM_CAL_SAMPLES;
+      RefCalibration.temperature /= (float)SIM_CAL_SAMPLES;
+      simCalibrated = true;
+      Serial.println(F("SHITL pressure calibrated"));
+    }
+    return NAN;  // skip state machine during calibration
   }
 #else
   adxl345.readAccelerometer(&sensors.accel_x, &sensors.accel_y, &sensors.accel_z);
@@ -147,7 +172,10 @@ static float readSensors() {
   return altitude;
 }
 
-static void sendControlPacket(float altitude) {
+void sendControlPacket(float altitude) {
+#if SIMULATION_MODE
+  return;  // no I2C in SHITL — local controller handles it
+#endif
   if (!USE_CONTROL || I2CControl.fallback || (millis() - I2CControl.lastSend < CONTROL_INTERVAL_MS)) return;
 
   ControlPacket controlPacket;
@@ -184,11 +212,10 @@ static void sendControlPacket(float altitude) {
       uint8_t cmdCrc = computeControlCRC(cmdBuf, sizeof(CommandPacket) - 1);
       if (cmdPkt.crc == cmdCrc) {
         sensors.potentiometer_value = cmdPkt.potentiometer_value;
-        if (state == States::ASCENT) {
-          airbrake_servo_1.setExtension(cmdPkt.servo_angle_1);
-          airbrake_servo_2.setExtension(cmdPkt.servo_angle_2);
-          BrakeState.pct = cmdPkt.servo_angle_1;
-        }
+        I2CControl.cmd_servo_1 = cmdPkt.servo_angle_1;
+        I2CControl.cmd_servo_2 = cmdPkt.servo_angle_2;
+        I2CControl.predicted_apogee = cmdPkt.predicted_apogee;
+        I2CControl.cd_add_cmd = cmdPkt.cd_add_cmd;
       }
     } else {
       // Drain any partial data
@@ -210,6 +237,10 @@ void setup() {
     statusIndicator.solid(StatusIndicator::RED);
   }
   statusIndicator.solid(StatusIndicator::RED);
+
+#if SIMULATION_MODE
+  Serial.setTimeout(100);  // don't block 1s per missed DATAREQUEST
+#endif
 
   Wire.setSDA(PinDefs.SDA);
   Wire.setSCL(PinDefs.SCL);
@@ -238,12 +269,17 @@ void setup() {
   logging.log(
       "Time,Xg,Yg,Zg,Xg_high,Yg_high,Zg_high,Pressure,Temperature,Altitude,"
       "BNO_X,BNO_Y,BNO_Z,BNO_I,BNO_J,BNO_K,BNO_Real,State,"
-      "Airbrake_pct,Airbrake_dir,Potentiometer");
+      "Airbrake_pct,Airbrake_dir,Predicted_Apogee,Cd_Add_Cmd,"
+      "I2C_Fallback,I2C_FailCount,Potentiometer");
   logging.flush();
 
   // Servo init LAST — SD.begin() internally calls SPI.begin() which claims pin 10
   airbrake_servo_1.begin(PinDefs.SERVO);
   airbrake_servo_2.begin(PinDefs.SERVO_2);
+
+#if SIMULATION_MODE
+  BrakeState.hasCheckedForHorizontal = true;  // skip horizontal/airbrake test in SHITL
+#endif
 
   if (failed_sensors > 0) {
     statusIndicator.solid(StatusIndicator::WHITE);
@@ -256,13 +292,40 @@ void setup() {
   }
 }
 
+#if SIMULATION_MODE
+static void runLocalController(float altitude) {
+  float vel = FlightState.velocity;
+  float alt_msl = altitude + RocketConfig::LAUNCH_SITE_ALT_MSL_M;
+  float sos = Atmosphere::speedOfSound(alt_msl);
+  float time_s = millis() / 1000.0f;
+  float dt = LOOP_INTERVAL_MS / 1000.0f;
+
+  float cd_add = airbrakeController.update(
+      altitude, vel, sensors.accel_y * 9.81f,
+      static_cast<uint8_t>(state), sos, time_s, dt);
+
+  float mach = fabsf(vel) / sos;
+  ServoAngles angles = CdLookup::cdToServoAngles(cd_add, mach);
+
+  I2CControl.cmd_servo_1 = angles.angle_1;
+  I2CControl.cmd_servo_2 = angles.angle_2;
+  I2CControl.predicted_apogee = airbrakeController.predictedApogee();
+  I2CControl.cd_add_cmd = cd_add;
+}
+#endif
+
 void loop() {
   unsigned long now = millis();
   if (now - last_loop_time < LOOP_INTERVAL_MS) return;
   last_loop_time = now;
 
   float altitude = readSensors();
+  if (isnan(altitude)) return;  // no valid SHITL data — don't run state machine
   updateStateMachine(altitude);
+#if SIMULATION_MODE
+  runLocalController(altitude);
+#else
   sendControlPacket(altitude);
-  logging.logTelemetry(altitude, sensors, BrakeState, state);
+#endif
+  logging.logTelemetry(altitude, sensors, BrakeState, I2CControl, state);
 }

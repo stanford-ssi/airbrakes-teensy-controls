@@ -11,8 +11,8 @@ namespace RocketConfig {
     constexpr float REF_AREA_M2 = 0.008107f; // Reference cross-section area
 
     // Target altitude
-    constexpr float TARGET_ALT_AGL_M = 9144.0f;  // 30,000 ft
-    constexpr float MAX_TARGET_ALT_M = 9144.0f;  // 30,000 ft (IREC max)
+    constexpr float TARGET_ALT_AGL_M = 8991.0f;  // 30,000 ft
+    constexpr float MAX_TARGET_ALT_M = 8991.0f;  // 30,000 ft (IREC max)
 
     // Launch site
     constexpr float LAUNCH_SITE_ALT_MSL_M = 823.0f; // FAR (Mojave)

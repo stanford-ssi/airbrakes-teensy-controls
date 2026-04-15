@@ -48,7 +48,8 @@ class Logging {
   bool begin();
   void flush();
   void logTelemetry(float altitude, const SensorData_t& sens,
-                    const BrakeState_t& brake, States st);
+                    const BrakeState_t& brake, const I2CControl_t& i2c,
+                    States st);
 
  private:
   bool debug;

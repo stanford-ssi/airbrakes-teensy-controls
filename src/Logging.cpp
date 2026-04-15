@@ -94,7 +94,7 @@ void Logging::flush() {
   }
 }
 
-void Logging::logTelemetry(float altitude, const SensorData_t &sens, const BrakeState_t &brake, States st) {
+void Logging::logTelemetry(float altitude, const SensorData_t &sens, const BrakeState_t &brake, const I2CControl_t &i2c, States st) {
   LogBuffer buf;
   buf.appendLong(millis());
   buf.field(sens.accel_x);
@@ -116,6 +116,10 @@ void Logging::logTelemetry(float altitude, const SensorData_t &sens, const Brake
   buf.field(stateToString(st));
   buf.field(brake.pct, 1);
   buf.field(brake.direction);
+  buf.field(i2c.predicted_apogee);
+  buf.field(i2c.cd_add_cmd, 4);
+  buf.field(i2c.fallback ? 1 : 0);
+  buf.field(i2c.failCount);
   buf.field((int)sens.potentiometer_value);
   log(buf.str());
 

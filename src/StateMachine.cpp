@@ -12,6 +12,7 @@ static States handleIdle() {
   if (sensors.accel_y > IGNITION_ACCEL_THRESHOLD) {
     FlightState.ignition_time = millis();
     FlightState.velocity = 0.0f;
+    primaryIgniter.arm();
     return States::IGNITION;
   }
 
@@ -63,6 +64,9 @@ static States handleIgnition() {
   return States::IGNITION;
 }
 
+static int apogeeConfirmCount = 0;
+static const int APOGEE_CONFIRM_THRESHOLD = 5;  // require 5 consecutive altitude decreases (~250ms)
+
 static States handleAscent(float altitude) {
   statusIndicator.solid(StatusIndicator::RED);
 
@@ -86,16 +90,27 @@ static States handleAscent(float altitude) {
         airbrake_servo_2.setExtension(BrakeState.pct);
       }
     }
+  } else {
+    sendControlPacket(altitude);
+    airbrake_servo_1.setExtension(I2CControl.cmd_servo_1);
+    airbrake_servo_2.setExtension(I2CControl.cmd_servo_2);
+    BrakeState.pct = I2CControl.cmd_servo_1;
   }
 
   FlightState.velocity += (sensors.accel_y_high_g - 1.0f) * 9.81f * (LOOP_INTERVAL_MS / 1000.0f);
 
   bool machLockout = FlightState.velocity > MACH_LOCKOUT_VELOCITY;
-  bool atApogee = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);
+  bool altDecreasing = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);
   bool timedOut = millis() - FlightState.ignition_time > APOGEE_TIMEOUT_MS;
   FlightState.prev_altitude = altitude;
 
-  if (atApogee || timedOut) {
+  if (altDecreasing) {
+    apogeeConfirmCount++;
+  } else {
+    apogeeConfirmCount = 0;
+  }
+
+  if (apogeeConfirmCount >= APOGEE_CONFIRM_THRESHOLD || timedOut) {
     airbrake_servo_1.setExtension(AIRBRAKE_MIN);
     airbrake_servo_2.setExtension(AIRBRAKE_MIN);
     BrakeState.pct = AIRBRAKE_MIN;
@@ -113,6 +128,7 @@ static States handleApogee() {
   primaryIgniter.fire();
 
   if (millis() - FlightState.fire_time > IGNITER_FIRE_DURATION_MS) {
+    primaryIgniter.stop();
     return States::DESCENT;
   }
 

@@ -17,7 +17,7 @@ struct SensorData_t {
 };
 
 struct BrakeState_t {
-  float pct = AIRBRAKE_MIN;
+  float pct = 0.0f;
   int direction = 1;
   unsigned long last_update = 0;
   bool hasCheckedForHorizontal = false;
@@ -36,6 +36,10 @@ struct I2CControl_t {
   unsigned long lastSend = 0;
   bool fallback = false;
   int failCount = 0;
+  float cmd_servo_1 = 0.0f;
+  float cmd_servo_2 = 0.0f;
+  float predicted_apogee = 0.0f;
+  float cd_add_cmd = 0.0f;
 };
 
 extern SensorData_t sensors;
@@ -47,3 +51,5 @@ extern StatusIndicator statusIndicator;
 extern Bilda airbrake_servo_1;
 extern Bilda airbrake_servo_2;
 extern Igniter primaryIgniter;
+
+void sendControlPacket(float altitude);
