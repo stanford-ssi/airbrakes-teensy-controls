@@ -4,36 +4,36 @@
 #include <SD.h>
 
 PinDefinitions::PinDefinitions()
-    : STATUS_LED_RED(5),
-      STATUS_LED_GREEN(6),
-      STATUS_LED_BLUE(7),
+    : STATUS_LED_RED(3),
+      STATUS_LED_GREEN(4),
+      STATUS_LED_BLUE(5),
 
-      IGNITER_0(21),
-      IGNITER_1(18),
+      IGNITER_0(29),
+      IGNITER_1(26),
 
-      IGNITER_SENSE_0(16),
-      IGNITER_SENSE_1(19),
+      IGNITER_SENSE_0(25),
+      IGNITER_SENSE_1(27),
 
-      SERVO(10),
-      SERVO_2(9),
+      SERVO(8),
+      SERVO_2(7),
 
-      BUZZER(11),
+      BUZZER(9),
 
-      ESP32_CS(12),
+      ESP32_CS(10),
       SD_CS(BUILTIN_SDCARD),
 
-      SCK(35),
-      SDI(13),
-      SDO(14),
+      SCK(13),
+      SDI(11),
+      SDO(12),
 
-      MCP_CS(33),
+      MCP_CS(20),
       MCP_INT(21),
 
-      SDA(40),
-      SCL(41),
+      SDA(18),
+      SCL(19),
 
       ARM(22) {
-  // Teensy 4.1 pin mapping (matches board schematic v4.1)
+  // Teensy 4.1 pin mapping
 }
 
 void PinDefinitions::setupPins() {
@@ -47,8 +47,7 @@ void PinDefinitions::setupPins() {
   pinMode(IGNITER_SENSE_0, INPUT);
   pinMode(IGNITER_SENSE_1, INPUT);
 
-  pinMode(SERVO, OUTPUT);
-  pinMode(SERVO_2, OUTPUT);
+  // Servo pins configured by Servo.attach(), not pinMode
 
   pinMode(BUZZER, OUTPUT);
 

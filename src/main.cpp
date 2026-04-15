@@ -206,14 +206,6 @@ void setup() {
   pinMode(PinDefs.IGNITER_0, OUTPUT);
   pinMode(PinDefs.IGNITER_1, OUTPUT);
 
-  airbrake_servo_1.begin(PinDefs.SERVO);
-  airbrake_servo_2.begin(PinDefs.SERVO_2);
-
-  // Must be AFTER servo init — pin 11 shares FlexPWM1 with pin 10,
-  // so servo attach() can reconfigure the timer and drive pin 11
-  pinMode(PinDefs.BUZZER, OUTPUT);
-  digitalWrite(PinDefs.BUZZER, LOW);
-
   while (!Serial) {
     statusIndicator.solid(StatusIndicator::RED);
   }
@@ -225,11 +217,6 @@ void setup() {
   Wire.setClock(100000);
 
   delay(4000);  // allow sensors to power up
-
-  SPI.setMOSI(PinDefs.SDI);
-  SPI.setMISO(PinDefs.SDO);
-  SPI.setSCK(PinDefs.SCK);
-  SPI.begin();
 
   while (!logging.begin()) {
     statusIndicator.solid(StatusIndicator::RED);
@@ -253,6 +240,10 @@ void setup() {
       "BNO_X,BNO_Y,BNO_Z,BNO_I,BNO_J,BNO_K,BNO_Real,State,"
       "Airbrake_pct,Airbrake_dir,Potentiometer");
   logging.flush();
+
+  // Servo init LAST — SD.begin() internally calls SPI.begin() which claims pin 10
+  airbrake_servo_1.begin(PinDefs.SERVO);
+  airbrake_servo_2.begin(PinDefs.SERVO_2);
 
   if (failed_sensors > 0) {
     statusIndicator.solid(StatusIndicator::WHITE);

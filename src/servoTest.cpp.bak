@@ -1,0 +1,79 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+// Test 1: Raw Servo library on pins 7 and 8
+// Test 2: analogWrite on pins 7 and 8 (hardware PWM check)
+// Test 3: Raw Servo on different pins (2 and 3) to confirm library works at all
+
+#define TEST 1  // Change this to 1, 2, or 3
+
+Servo raw_servo_1;
+Servo raw_servo_2;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+#if TEST == 1
+  Serial.println("TEST 1: Raw Servo on pins 7 and 8");
+  raw_servo_1.attach(8);
+  raw_servo_2.attach(7);
+  Serial.print("Servo1 attached: ");
+  Serial.println(raw_servo_1.attached() ? "YES" : "NO");
+  Serial.print("Servo2 attached: ");
+  Serial.println(raw_servo_2.attached() ? "YES" : "NO");
+
+#elif TEST == 2
+  Serial.println("TEST 2: analogWrite PWM on pins 7 and 8");
+  analogWriteFrequency(8, 50);
+  analogWriteFrequency(7, 50);
+  pinMode(8, OUTPUT);
+  pinMode(7, OUTPUT);
+
+#elif TEST == 3
+  Serial.println("TEST 3: Raw Servo on pins 2 and 3 (control test)");
+  raw_servo_1.attach(2);
+  raw_servo_2.attach(3);
+  Serial.print("Servo1 attached: ");
+  Serial.println(raw_servo_1.attached() ? "YES" : "NO");
+  Serial.print("Servo2 attached: ");
+  Serial.println(raw_servo_2.attached() ? "YES" : "NO");
+#endif
+
+  Serial.println("Running...");
+}
+
+void loop() {
+#if TEST == 1 || TEST == 3
+  Serial.println("1000us");
+  raw_servo_1.writeMicroseconds(1000);
+  raw_servo_2.writeMicroseconds(1000);
+  delay(2000);
+
+  Serial.println("1500us");
+  raw_servo_1.writeMicroseconds(1500);
+  raw_servo_2.writeMicroseconds(1500);
+  delay(2000);
+
+  Serial.println("2000us");
+  raw_servo_1.writeMicroseconds(2000);
+  raw_servo_2.writeMicroseconds(2000);
+  delay(2000);
+
+#elif TEST == 2
+  Serial.println("25% duty");
+  analogWrite(8, 64);
+  analogWrite(7, 64);
+  delay(2000);
+
+  Serial.println("50% duty");
+  analogWrite(8, 128);
+  analogWrite(7, 128);
+  delay(2000);
+
+  Serial.println("75% duty");
+  analogWrite(8, 192);
+  analogWrite(7, 192);
+  delay(2000);
+#endif
+}
