@@ -1,24 +1,14 @@
 #include "Logging.h"
 
-#include <RTClib.h>
 #include <SD.h>
 #include <States.h>
+#include <TimeLib.h>
 
-RTC_DS3231 rtc;
-bool rtc_ready = false;
+static time_t getTeensy3Time() { return Teensy3Clock.get(); }
 
 void dateTime(uint16_t *date, uint16_t *time) {
-  DateTime now;
-
-  if (rtc_ready) {
-    now = rtc.now();
-  } else {
-    // fallback to compile time
-    now = DateTime(F(__DATE__), F(__TIME__));
-  }
-
-  *date = FAT_DATE(now.year(), now.month(), now.day());
-  *time = FAT_TIME(now.hour(), now.minute(), now.second());
+  *date = FAT_DATE(year(), month(), day());
+  *time = FAT_TIME(hour(), minute(), second());
 }
 
 Logging::Logging(bool debug, bool logToSD, int SD_CS) {
@@ -45,22 +35,20 @@ int Logging::getNextLogFileNumber() {
 bool Logging::begin() {
   if (debug) {
     delay(100);
-    Serial1.println(F("Logger starting..."));
+    Serial.println(F("Logger starting..."));
   }
 
-  if (!rtc.begin()) {
-    if (debug) Serial1.println(F("RTC not found, using compile time"));
-    rtc_ready = false;
-  } else {
-    rtc_ready = true;
+  setSyncProvider(getTeensy3Time);
+  if (timeStatus() != timeSet) {
+    if (debug) Serial.println(F("Teensy RTC not set, using compile time"));
   }
 
   if (logToSD) {
     if (!SD.begin(SD_CS)) {
-      Serial1.println(F("SD init failed"));
+      Serial.println(F("SD init failed"));
       return false;
     } else {
-      Serial1.println("SD init succeeded");
+      Serial.println("SD init succeeded");
     }
 
     // callback so SD sets file timestamps
@@ -69,17 +57,17 @@ bool Logging::begin() {
     int logNumber = getNextLogFileNumber();
     char logFileName[20];
     sprintf(logFileName, "LOG%03d.TXT", logNumber);
-    Serial1.print("Opening log file: ");
-    Serial1.println(logFileName);
+    Serial.print("Opening log file: ");
+    Serial.println(logFileName);
     dataFile = SD.open(logFileName, FILE_WRITE);
     if (!dataFile) {
-      Serial1.print("Failed to open file: ");
-      Serial1.println(logFileName);
+      Serial.print("Failed to open file: ");
+      Serial.println(logFileName);
       return false;
     }
 
-    Serial1.print("Logging to ");
-    Serial1.println(logFileName);
+    Serial.print("Logging to ");
+    Serial.println(logFileName);
   }
 
   return true;
@@ -88,9 +76,9 @@ bool Logging::begin() {
 void Logging::log(const char *message, bool newline) {
   if (debug) {
     if (newline)
-      Serial1.println(message);
+      Serial.println(message);
     else
-      Serial1.print(message);
+      Serial.print(message);
   }
   if (logToSD) {
     if (newline)

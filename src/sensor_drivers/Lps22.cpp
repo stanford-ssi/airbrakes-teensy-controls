@@ -6,14 +6,14 @@ Lps22::Lps22(uint8_t address) { LPS22_ADDRESS = address; }
 bool Lps22::begin() {
   uint8_t deviceId = readRegister(0x0F);
   if (deviceId != 0xB3) {
-    Serial1.print("Error: Could not find Lps22 sensor with address 0x");
-    Serial1.print(LPS22_ADDRESS, HEX);
-    Serial1.print(", received 0x");
-    Serial1.println(deviceId, HEX);
+    Serial.print("Error: Could not find Lps22 sensor with address 0x");
+    Serial.print(LPS22_ADDRESS, HEX);
+    Serial.print(", received 0x");
+    Serial.println(deviceId, HEX);
     return false;
   }
 
-  writeRegister(0x10, 0x90);  // Power on the sensor
+  writeRegister(0x10, 0x50);  // CTRL_REG1: 75Hz ODR, no low-pass filter, no BDU
   return true;
 }
 
@@ -24,7 +24,7 @@ void Lps22::readPressure(float *pressure) {
   Wire.beginTransmission(LPS22_ADDRESS);
   Wire.write(0x28);                        // Start reading from data registers
   if (Wire.endTransmission(false) != 0) {  // Check if transmission failed
-    Serial1.println("Error: Failed to write to Lps22!");
+    Serial.println("Error: Failed to write to Lps22!");
     return;  // Exit if transmission failed
   }
 
@@ -33,8 +33,8 @@ void Lps22::readPressure(float *pressure) {
 
   // Check if we received all the bytes we expect
   if (bytesReceived != 3) {
-    Serial1.print("Error: Expected 3 bytes, received ");
-    Serial1.println(bytesReceived);
+    Serial.print("Error: Expected 3 bytes, received ");
+    Serial.println(bytesReceived);
     return;  // Exit if we didn't receive the expected data
   }
 
@@ -43,7 +43,7 @@ void Lps22::readPressure(float *pressure) {
     if (Wire.available()) {
       buffer[i] = Wire.read();
     } else {
-      Serial1.println("Error: Data not available!");
+      Serial.println("Error: Data not available!");
       return;  // Exit if data is not available
     }
   }
@@ -61,7 +61,7 @@ void Lps22::readTemperature(float *temperature) {
   Wire.beginTransmission(LPS22_ADDRESS);
   Wire.write(0x2B);                        // Start reading from data registers
   if (Wire.endTransmission(false) != 0) {  // Check if transmission failed
-    Serial1.println("Error: Failed to write to Lps22!");
+    Serial.println("Error: Failed to write to Lps22!");
     return;  // Exit if transmission failed
   }
 
@@ -70,8 +70,8 @@ void Lps22::readTemperature(float *temperature) {
 
   // Check if we received all the bytes we expect
   if (bytesReceived != 2) {
-    Serial1.print("Error: Expected 2 bytes, received ");
-    Serial1.println(bytesReceived);
+    Serial.print("Error: Expected 2 bytes, received ");
+    Serial.println(bytesReceived);
     return;  // Exit if we didn't receive the expected data
   }
 
@@ -80,7 +80,7 @@ void Lps22::readTemperature(float *temperature) {
     if (Wire.available()) {
       buffer[i] = Wire.read();
     } else {
-      Serial1.println("Error: Data not available!");
+      Serial.println("Error: Data not available!");
       return;  // Exit if data is not available
     }
   }
@@ -115,7 +115,7 @@ void Lps22::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
   Wire.beginTransmission(LPS22_ADDRESS);
   Wire.write(reg);                         // Start reading from data registers
   if (Wire.endTransmission(false) != 0) {  // Check if transmission failed
-    Serial1.println("Error: Failed to write to Lps22!");
+    Serial.println("Error: Failed to write to Lps22!");
     return;  // Exit if transmission failed
   }
 
@@ -124,10 +124,10 @@ void Lps22::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
 
   // Check if we received all the bytes we expect
   if (bytesReceived != len) {
-    Serial1.print("Error: Expected ");
-    Serial1.print(len);
-    Serial1.print(" bytes, received ");
-    Serial1.println(bytesReceived);
+    Serial.print("Error: Expected ");
+    Serial.print(len);
+    Serial.print(" bytes, received ");
+    Serial.println(bytesReceived);
     return;  // Exit if we didn't receive the expected data
   }
 
@@ -136,7 +136,7 @@ void Lps22::readRegisters(uint8_t reg, uint8_t *buffer, uint8_t len) {
     if (Wire.available()) {
       buffer[i] = Wire.read();
     } else {
-      Serial1.println("Error: Data not available!");
+      Serial.println("Error: Data not available!");
       return;  // Exit if data is not available
     }
   }

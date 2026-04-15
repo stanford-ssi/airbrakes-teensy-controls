@@ -6,7 +6,7 @@ bool BNO::begin() {
   // Give the BNO time to boot up after power-on or reset
   delay(300);
 
-  Serial1.println("Initializing BNO080...");
+  Serial.println("Initializing BNO080...");
 
   // BNO085 uses address 0x4A by default
   // Some versions of the library need the address, some don't
@@ -15,16 +15,16 @@ bool BNO::begin() {
   // Try with default address first (no parameter)
   if (bno_.begin()) {
     initialized = true;
-    Serial1.println("BNO080 connected at default address");
+    Serial.println("BNO080 connected at default address");
   } else {
     // Try with explicit address 0x4A
-    Serial1.println("Trying explicit address 0x4A...");
+    Serial.println("Trying explicit address 0x4A...");
     if (bno_.begin(i2cAddress_)) {
       initialized = true;
-      Serial1.print("BNO080 connected at 0x");
-      Serial1.println(i2cAddress_, HEX);
+      Serial.print("BNO080 connected at 0x");
+      Serial.println(i2cAddress_, HEX);
     } else {
-      Serial1.println("BNO080 failed to initialize!");
+      Serial.println("BNO080 failed to initialize!");
       return false;
     }
   }
@@ -36,7 +36,7 @@ bool BNO::begin() {
   // Give it a moment to start reporting
   delay(150);
 
-  Serial1.println("BNO080 fully initialized!");
+  Serial.println("BNO080 fully initialized!");
   return true;
 }
 

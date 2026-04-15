@@ -11,12 +11,13 @@ static States handleIdle() {
 
   if (sensors.accel_y > IGNITION_ACCEL_THRESHOLD) {
     FlightState.ignition_time = millis();
+    FlightState.velocity = 0.0f;
     return States::IGNITION;
   }
 
   if (!BrakeState.hasCheckedForHorizontal) {
-    if (abs(sensors.accel_y) < abs(sensors.accel_x) ||
-        abs(sensors.accel_y) < abs(sensors.accel_z)) {
+    if (abs(sensors.accel_x) > abs(sensors.accel_z) ||
+        abs(sensors.accel_y) > abs(sensors.accel_z)) {
       BrakeState.direction = 1;
       BrakeState.last_update = 0;
       BrakeState.pct = AIRBRAKE_MIN;
@@ -34,7 +35,7 @@ static States handleAirbrakeTest() {
   if (millis() - BrakeState.last_update >=
       (BrakeState.pct <= AIRBRAKE_MIN ? TEST_SWEEP_PAUSE_MS : TEST_SWEEP_INTERVAL_MS)) {
     BrakeState.last_update = millis();
-    BrakeState.pct += AIRBRAKE_MAX * BrakeState.direction;
+    BrakeState.pct += TEST_SWEEP_STEP * BrakeState.direction;
     if (BrakeState.pct >= AIRBRAKE_MAX) {
       BrakeState.pct = AIRBRAKE_MAX;
       BrakeState.direction = -1;
@@ -51,6 +52,8 @@ static States handleAirbrakeTest() {
 
 static States handleIgnition() {
   statusIndicator.solid(StatusIndicator::ORANGE);
+
+  FlightState.velocity += (sensors.accel_y_high_g - 1.0f) * 9.81f * (LOOP_INTERVAL_MS / 1000.0f);
 
   if (sensors.accel_y < 0) {
     FlightState.motor_burnout_time = millis();
@@ -85,7 +88,14 @@ static States handleAscent(float altitude) {
     }
   }
 
-  if (millis() - FlightState.ignition_time > APOGEE_TIMEOUT_MS) {
+  FlightState.velocity += (sensors.accel_y_high_g - 1.0f) * 9.81f * (LOOP_INTERVAL_MS / 1000.0f);
+
+  bool machLockout = FlightState.velocity > MACH_LOCKOUT_VELOCITY;
+  bool atApogee = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);
+  bool timedOut = millis() - FlightState.ignition_time > APOGEE_TIMEOUT_MS;
+  FlightState.prev_altitude = altitude;
+
+  if (atApogee || timedOut) {
     airbrake_servo_1.setExtension(AIRBRAKE_MIN);
     airbrake_servo_2.setExtension(AIRBRAKE_MIN);
     BrakeState.pct = AIRBRAKE_MIN;

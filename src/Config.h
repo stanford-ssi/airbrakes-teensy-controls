@@ -16,7 +16,9 @@ const float AIRBRAKE_MAX = 60.0;
 // State machine thresholds
 const float IGNITION_ACCEL_THRESHOLD = 8.0;     // g — Y-axis accel to detect ignition
 const float LANDING_ALTITUDE_THRESHOLD = 5.0;   // meters AGL
-const unsigned long APOGEE_TIMEOUT_MS = 30000;  // ms after ignition to declare apogee
+const unsigned long APOGEE_TIMEOUT_MS = 60000;  // ms after ignition — hard fallback to declare apogee
+const float APOGEE_MIN_ALTITUDE = 30.48f;       // 100 ft in meters — minimum AGL to declare apogee
+const float MACH_LOCKOUT_VELOCITY = 250.0f;  // m/s — lock out baro apogee detection above this speed (~Mach 0.73)
 const unsigned long IGNITER_FIRE_DURATION_MS = 2000;
 
 // Fallback sweep (open-loop when control Teensy unavailable)
@@ -29,3 +31,4 @@ const float FALLBACK_SWEEP_STEP = 25.0;                  // percent per step
 // Airbrake test sweep
 const unsigned long TEST_SWEEP_PAUSE_MS = 3000;  // pause at min position
 const unsigned long TEST_SWEEP_INTERVAL_MS = 1000;
+const float TEST_SWEEP_STEP = 25.0;  // percent per step

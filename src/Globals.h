@@ -28,6 +28,8 @@ struct FlightState_t {
   int motor_burnout_time = 0;
   int fire_time = 0;
   float max_altitude = 0.0f;
+  float prev_altitude = 0.0f;
+  float velocity = 0.0f;  // m/s, integrated from ignition
 };
 
 struct I2CControl_t {

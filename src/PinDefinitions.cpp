@@ -1,38 +1,39 @@
 #include "PinDefinitions.h"
 
 #include <Arduino.h>
+#include <SD.h>
 
 PinDefinitions::PinDefinitions()
-    : STATUS_LED_RED(PB5),
-      STATUS_LED_GREEN(PB4),
-      STATUS_LED_BLUE(PB3),
+    : STATUS_LED_RED(5),
+      STATUS_LED_GREEN(6),
+      STATUS_LED_BLUE(7),
 
-      IGNITER_0(PB10),
-      IGNITER_1(PB11),
+      IGNITER_0(21),
+      IGNITER_1(18),
 
-      IGNITER_SENSE_0(PB0),
-      IGNITER_SENSE_1(PB1),
+      IGNITER_SENSE_0(16),
+      IGNITER_SENSE_1(19),
 
-      SERVO(PA1),
-      SERVO_2(PB6),
+      SERVO(10),
+      SERVO_2(9),
 
-      BUZZER(PA3),
+      BUZZER(11),
 
-      ESP32_CS(PA12),
-      SD_CS(PA4),
+      ESP32_CS(12),
+      SD_CS(BUILTIN_SDCARD),
 
-      SCK(PA5),
-      SDI(PA7),
-      SDO(PA6),
+      SCK(35),
+      SDI(13),
+      SDO(14),
 
-      MCP_CS(PA11),
-      MCP_INT(PA8),
+      MCP_CS(33),
+      MCP_INT(21),
 
-      SDA(PB9),
-      SCL(PB8),
+      SDA(40),
+      SCL(41),
 
-      ARM(PB13) {
-  // Constructor
+      ARM(22) {
+  // Teensy 4.1 pin mapping (matches board schematic v4.1)
 }
 
 void PinDefinitions::setupPins() {

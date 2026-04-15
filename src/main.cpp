@@ -1,4 +1,3 @@
-#define I2C_BUFFER_LENGTH 128
 #define DEBUG_MODE 1  // Set to 0 for flight, 1 for bench testing
 
 #include <Arduino.h>
@@ -15,8 +14,8 @@
 #include <sensor_drivers/BNO.h>
 #include <sensor_drivers/Lps22.h>
 
-#define SIMULATION_MODE 1
-#define USE_BNO080 1
+#define SIMULATION_MODE 0
+#define USE_BNO080 0
 #define USE_TELEMETRY 0
 
 // Sensors
@@ -53,15 +52,23 @@ static struct {
 } RefCalibration;
 
 static void calibrateSensors(Lps22 &lps) {
+  delay(100);  // let LPS22 produce valid readings after begin()
+  int valid = 0;
   for (int i = 0; i < 10; i++) {
-    float p, t;
+    float p = 0.0f, t = 0.0f;
     lps.readPressure(&p);
     lps.readTemperature(&t);
-    RefCalibration.pressure += p;
-    RefCalibration.temperature += t;
+    if (p > 0.0f) {
+      RefCalibration.pressure += p;
+      RefCalibration.temperature += t;
+      valid++;
+    }
+    delay(25);  // LPS22 at 50Hz needs ~20ms between readings
   }
-  RefCalibration.pressure /= 10.0f;
-  RefCalibration.temperature = (RefCalibration.temperature / 10.0f) + CELSIUS_TO_KELVIN;
+  if (valid > 0) {
+    RefCalibration.pressure /= (float)valid;
+    RefCalibration.temperature = (RefCalibration.temperature / (float)valid) + CELSIUS_TO_KELVIN;
+  }
 }
 
 template <typename T>  // generic sensor
@@ -69,17 +76,17 @@ static bool initSensor(T &sensor, const char *name, int maxAttempts = 10) {
   int attempts = 0;
   while (!sensor.begin()) {
     logging.log(name);
-    Serial1.print(F("Waiting for "));
-    Serial1.print(name);
-    Serial1.println(F("..."));
+    Serial.print(F("Waiting for "));
+    Serial.print(name);
+    Serial.println(F("..."));
     delay(1000);
     if (++attempts >= maxAttempts) {
       failed_sensors++;
       return false;
     }
   }
-  Serial1.print(name);
-  Serial1.println(F(" initialized"));
+  Serial.print(name);
+  Serial.println(F(" initialized"));
   return true;
 }
 
@@ -97,9 +104,9 @@ static float altitudeDelta(float p, float T) {
 
 static float readSensors() {
 #if SIMULATION_MODE
-  Serial1.println("DATAREQUEST");
+  Serial.println("DATAREQUEST");
   char buf[128];
-  int len = Serial1.readBytesUntil('\n', buf, sizeof(buf) - 1);
+  int len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
   buf[len] = '\0';
 
   float values[6];
@@ -161,7 +168,7 @@ static void sendControlPacket(float altitude) {
     I2CControl.failCount++;
     if (I2CControl.failCount >= I2C_FAIL_THRESHOLD) {
       I2CControl.fallback = true;
-      Serial1.println(F("Control Teensy I2C failed, switching to fallback"));
+      Serial.println(F("Control Teensy I2C failed, switching to fallback"));
     }
   } else {
     I2CControl.failCount = 0;
@@ -193,7 +200,7 @@ static void sendControlPacket(float altitude) {
 }
 
 void setup() {
-  Serial1.begin(115200);
+  Serial.begin(115200);
 
   pinMode(PinDefs.ARM, INPUT_PULLUP);
   pinMode(PinDefs.IGNITER_0, OUTPUT);
@@ -202,7 +209,12 @@ void setup() {
   airbrake_servo_1.begin(PinDefs.SERVO);
   airbrake_servo_2.begin(PinDefs.SERVO_2);
 
-  while (!Serial1) {
+  // Must be AFTER servo init — pin 11 shares FlexPWM1 with pin 10,
+  // so servo attach() can reconfigure the timer and drive pin 11
+  pinMode(PinDefs.BUZZER, OUTPUT);
+  digitalWrite(PinDefs.BUZZER, LOW);
+
+  while (!Serial) {
     statusIndicator.solid(StatusIndicator::RED);
   }
   statusIndicator.solid(StatusIndicator::RED);
@@ -216,15 +228,15 @@ void setup() {
 
   SPI.setMOSI(PinDefs.SDI);
   SPI.setMISO(PinDefs.SDO);
-  SPI.setSCLK(PinDefs.SCK);
+  SPI.setSCK(PinDefs.SCK);
   SPI.begin();
 
   while (!logging.begin()) {
     statusIndicator.solid(StatusIndicator::RED);
-    Serial1.println(F("Waiting for SD card..."));
+    Serial.println(F("Waiting for SD card..."));
     delay(1000);
   }
-  Serial1.println(F("SD card initialized"));
+  Serial.println(F("SD card initialized"));
 
 #if !SIMULATION_MODE
   initSensor(adxl345, "ADXL345");
@@ -237,18 +249,18 @@ void setup() {
 #endif
 
   logging.log(
-      "Time,Xg,Yg,Zg,Xhg,Yhg,Zhg,Pressure,Temperature,Altitude,"
+      "Time,Xg,Yg,Zg,Xg_high,Yg_high,Zg_high,Pressure,Temperature,Altitude,"
       "BNO_X,BNO_Y,BNO_Z,BNO_I,BNO_J,BNO_K,BNO_Real,State,"
       "Airbrake_pct,Airbrake_dir,Potentiometer");
   logging.flush();
 
   if (failed_sensors > 0) {
     statusIndicator.solid(StatusIndicator::WHITE);
-    Serial1.println(F("Setup failed"));
+    Serial.println(F("Setup failed"));
     state = States::SENSOR_ERROR;
   } else {
     statusIndicator.solid(StatusIndicator::GREEN);
-    Serial1.println(F("Setup complete"));
+    Serial.println(F("Setup complete"));
     state = States::IDLE;
   }
 }

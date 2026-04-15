@@ -13,8 +13,8 @@ Adxl::Adxl(uint8_t address, ADXL_TYPE adxlType) {
 bool Adxl::begin() {
   uint8_t deviceId = readRegister(0x00);
   if (deviceId != 0xE5) {
-    Serial1.print("Error: Could not find ADXL sensor with address 0x");
-    Serial1.println(ADXL_ADDRESS, HEX);
+    Serial.print("Error: Could not find ADXL sensor with address 0x");
+    Serial.println(ADXL_ADDRESS, HEX);
     return false;
   }
 
@@ -34,7 +34,7 @@ void Adxl::readAccelerometer(float *x, float *y, float *z) {
   Wire.beginTransmission(ADXL_ADDRESS);
   Wire.write(0x32);                        // Start reading from data registers
   if (Wire.endTransmission(false) != 0) {  // Check if transmission failed
-    Serial1.println("Error: Failed to write to ADXL345!");
+    Serial.println("Error: Failed to write to ADXL345!");
     return;  // Exit if transmission failed
   }
 
@@ -43,8 +43,8 @@ void Adxl::readAccelerometer(float *x, float *y, float *z) {
 
   // Check if we received all the bytes we expect
   if (bytesReceived != 6) {
-    Serial1.print("Error: Expected 6 bytes, received ");
-    Serial1.println(bytesReceived);
+    Serial.print("Error: Expected 6 bytes, received ");
+    Serial.println(bytesReceived);
     return;  // Exit if we didn't receive the expected data
   }
 
@@ -53,7 +53,7 @@ void Adxl::readAccelerometer(float *x, float *y, float *z) {
     if (Wire.available()) {
       buffer[i] = Wire.read();
     } else {
-      Serial1.println("Error: Data not available!");
+      Serial.println("Error: Data not available!");
       return;  // Exit if data is not available
     }
   }
@@ -69,9 +69,9 @@ void Adxl::readAccelerometer(float *x, float *y, float *z) {
   *z = z_raw * g_per_LSB;
 
   // Optional: Print the raw data for debugging
-  // Serial1.print("X: "); Serial1.print(*x);
-  // Serial1.print(" Y: "); Serial1.print(*y);
-  // Serial1.print(" Z: "); Serial1.println(*z);
+  // Serial.print("X: "); Serial.print(*x);
+  // Serial.print(" Y: "); Serial.print(*y);
+  // Serial.print(" Z: "); Serial.println(*z);
 }
 
 void Adxl::writeRegister(uint8_t reg, uint8_t value) {
