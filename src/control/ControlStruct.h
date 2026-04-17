@@ -14,7 +14,7 @@ struct ControlPacket {
   uint8_t crc;           // 1 byte
 } __attribute__((packed));
 
-// CommandPacket: Teensy → STM32 (18 bytes)
+// CommandPacket: Teensy → STM32 (20 bytes)
 struct CommandPacket {
   float servo_angle_1;           // 4 bytes (percentage 0-100)
   float servo_angle_2;           // 4 bytes (percentage 0-100)

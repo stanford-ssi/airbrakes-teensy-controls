@@ -9,9 +9,11 @@ const int I2C_FAIL_THRESHOLD = 10;
 // Loop timing
 const unsigned long LOOP_INTERVAL_MS = 50;
 
-// Airbrake limits (sweep/test bounds — must stay >= RocketConfig::SERVO_MIN_PCT)
-const float AIRBRAKE_MIN = 20.0;
-const float AIRBRAKE_MAX = 60.0;
+// Airbrake sweep/test bounds — in airbrake deployment % (0 = fully retracted,
+// 100 = fully extended). Mapped onto physical servo range via
+// RocketConfig::airbrakePctToServoPct() at the driveServos() boundary.
+const float AIRBRAKE_MIN = 0.0;
+const float AIRBRAKE_MAX = 50.0;
 
 // State machine thresholds
 const float IGNITION_ACCEL_THRESHOLD = 8.0;     // g — Y-axis accel to detect ignition

@@ -29,6 +29,19 @@ public:
     float predictedApogee() const { return predicted_apogee_; }
     State controllerState() const { return state_; }
 
+    // Clear internal state so a new SHITL run starts cleanly without a
+    // firmware reflash — otherwise launch_detected_ / apogee_detected_
+    // carry over from a previous session and suppress the controller.
+    void reset() {
+        state_ = CTRL_IDLE;
+        cd_add_cmd_ = 0.0f;
+        predicted_apogee_ = 0.0f;
+        apogee_time_ = 0.0f;
+        apogee_detected_ = false;
+        launch_time_ = 0.0f;
+        launch_detected_ = false;
+    }
+
 private:
     ApogeePredictor predictor_;
     State state_;

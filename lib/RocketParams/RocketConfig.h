@@ -2,27 +2,47 @@
 
 namespace RocketConfig {
     // Mass properties (V2 rocket — matches SHITL dashboard sim)
-    constexpr float MASS_KG = 23.28f;
+    constexpr float MASS_KG = 31.309f;
 
     // Aerodynamic properties (V2 rocket — flat-plate airbrake model)
     constexpr float BODY_CD = 0.364f;       // Representative body Cd (V2 Cd-vs-Mach midpoint)
     // CFD table gives cd_add up to ~1.41 (mach 0.1) ... ~1.50 (mach 0.8) at 95° deploy.
     // 1.5 lets the inverse lookup naturally saturate to ANGLE_MAX (100% servo) when commanded full.
-    constexpr float MAX_CD_ADD = 1.5f;
+    constexpr float MAX_CD_ADD = 2.5f;
     constexpr float MAX_CD = BODY_CD + MAX_CD_ADD;
-    constexpr float REF_AREA_M2 = 0.01929f; // Reference cross-section area (V2 diameter 0.15672m)
+    constexpr float REF_AREA_M2 = 0.015672f; // Reference cross-section area (V2 diameter 0.15672m)
 
     // Target altitude
     constexpr float TARGET_ALT_AGL_M = 9144.0f;  // 30,000 ft
     constexpr float MAX_TARGET_ALT_M = 9144.0f;  // 30,000 ft (IREC max)
 
     // Launch site
-    constexpr float LAUNCH_SITE_ALT_MSL_M = 630.9f; // FAR (Mojave) 2070 ft MSL
+    constexpr float LAUNCH_SITE_ALT_MSL_M = 792.0f; // FAR
 
     // Controller limits
     constexpr float SERVO_MIN_PCT = 20.0f;   // Minimum servo extension (%) — mechanical park position, never commanded below this
     constexpr float SERVO_MAX_PCT = 100.0f;  // Maximum servo extension (%)
-    constexpr float CD_SLEW_RATE_MAX = 1.5f; // Max Cd change rate (Cd/s)
+    constexpr float CD_SLEW_RATE_MAX = 1.9f; // Max Cd change rate (Cd/s)
+
+    // Airbrake deployment percentage <-> servo extension percentage.
+    // Airbrake % is the user-facing scale: 0 = fully retracted, 100 = fully
+    // extended. It maps linearly onto the physical servo range
+    // [SERVO_MIN_PCT, SERVO_MAX_PCT]. Keep these scales conceptually distinct
+    // — code that thinks in deployment ratios (sweep bounds, dashboard gauges)
+    // uses airbrake %, code that drives the actuator uses servo %.
+    inline float airbrakePctToServoPct(float airbrake_pct) {
+        if (airbrake_pct < 0.0f) airbrake_pct = 0.0f;
+        if (airbrake_pct > 100.0f) airbrake_pct = 100.0f;
+        return SERVO_MIN_PCT + (airbrake_pct / 100.0f) * (SERVO_MAX_PCT - SERVO_MIN_PCT);
+    }
+    inline float servoPctToAirbrakePct(float servo_pct) {
+        const float span = SERVO_MAX_PCT - SERVO_MIN_PCT;
+        if (span <= 0.0f) return 0.0f;
+        float t = (servo_pct - SERVO_MIN_PCT) / span;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        return t * 100.0f;
+    }
 
     // Physics
     constexpr float G = 9.80665f;            // Gravitational acceleration (m/s²)

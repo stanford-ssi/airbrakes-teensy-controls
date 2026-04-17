@@ -2,7 +2,7 @@
 
 Adxl::Adxl(uint8_t address, ADXL_TYPE adxlType) {
   ADXL_ADDRESS = address;
-  adxlType = adxlType;
+  this->adxlType = adxlType;
   if (adxlType == ADXL345) {
     g_per_LSB = 0.0040;  // ±16g at 4 mg/LSB
   } else if (adxlType == ADXL375) {

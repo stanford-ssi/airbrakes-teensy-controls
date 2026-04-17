@@ -24,19 +24,28 @@
 #define USE_TELEMETRY 0
 
 // ── Operating Modes ──────────────────────────────────────────────
-// FLIGHT:     Real sensors, full state machine, actual launch
-// SHITL:      Simulated sensors from serial, local controller, servos active
-// SHITL_DEMO: Same as SHITL but physical servos are NOT driven (demo/bench)
-// TEST:       Real sensors, servo testing, no state machine
-enum class TeensyMode { FLIGHT, SHITL, SHITL_DEMO, TEST };
+// FLIGHT:        Real sensors, full state machine, actual launch
+// SHITL:         Simulated sensors from serial, local controller, servos active
+// SHITL_DEMO:    Same as SHITL but physical servos are NOT driven (demo/bench)
+// TEST:          Real sensors, servo testing, no state machine
+// SENSOR_MOVING: Real sensors, UKF runs, no state machine, no servo motion.
+//                Logs CSV to SD in the same format as FLIGHT so ground tests
+//                (carrying/rotating/shaking the rocket) produce a file that
+//                parses with the same tooling.
+enum class TeensyMode { FLIGHT, SHITL, SHITL_DEMO, TEST, SENSOR_MOVING };
 static TeensyMode currentMode = TeensyMode::FLIGHT;
 
 static inline bool isSimMode(TeensyMode m) {
   return m == TeensyMode::SHITL || m == TeensyMode::SHITL_DEMO;
 }
 
+// driveServos: command the physical servos by extension % [SERVO_MIN_PCT..SERVO_MAX_PCT].
+// BrakeState.pct mirrors the same command in user-facing airbrake-% [0..100]
+// (0 at SERVO_MIN_PCT, 100 at SERVO_MAX_PCT) so the logged Airbrake_pct column
+// reads the way operators expect — 0 when retracted, not 20.
 void driveServos(float pct) {
-  BrakeState.pct = pct;
+  pct = constrain(pct, RocketConfig::SERVO_MIN_PCT, RocketConfig::SERVO_MAX_PCT);
+  BrakeState.pct = RocketConfig::servoPctToAirbrakePct(pct);
   if (currentMode == TeensyMode::SHITL_DEMO) return;
   airbrake_servo_1.setExtension(pct);
   airbrake_servo_2.setExtension(pct);
@@ -44,10 +53,11 @@ void driveServos(float pct) {
 
 static const char* modeToString(TeensyMode m) {
   switch (m) {
-    case TeensyMode::FLIGHT:     return "FLIGHT";
-    case TeensyMode::SHITL:      return "SHITL";
-    case TeensyMode::SHITL_DEMO: return "SHITL_DEMO";
-    case TeensyMode::TEST:       return "TEST";
+    case TeensyMode::FLIGHT:        return "FLIGHT";
+    case TeensyMode::SHITL:         return "SHITL";
+    case TeensyMode::SHITL_DEMO:    return "SHITL_DEMO";
+    case TeensyMode::TEST:          return "TEST";
+    case TeensyMode::SENSOR_MOVING: return "SENSOR_MOVING";
   }
   return "UNKNOWN";
 }
@@ -194,10 +204,11 @@ static float filterAltitude(float raw_alt) {
 // Exact-match MODE,<name> against the line (no null-terminator fuzz, no
 // prefix-order gotchas — SHITL vs SHITL_DEMO is unambiguous).
 static bool parseMode(const char *line, TeensyMode *out) {
-  if (strcmp(line, "MODE,FLIGHT")     == 0) { *out = TeensyMode::FLIGHT;     return true; }
-  if (strcmp(line, "MODE,SHITL")      == 0) { *out = TeensyMode::SHITL;      return true; }
-  if (strcmp(line, "MODE,SHITL_DEMO") == 0) { *out = TeensyMode::SHITL_DEMO; return true; }
-  if (strcmp(line, "MODE,TEST")       == 0) { *out = TeensyMode::TEST;       return true; }
+  if (strcmp(line, "MODE,FLIGHT")        == 0) { *out = TeensyMode::FLIGHT;        return true; }
+  if (strcmp(line, "MODE,SHITL")         == 0) { *out = TeensyMode::SHITL;         return true; }
+  if (strcmp(line, "MODE,SHITL_DEMO")    == 0) { *out = TeensyMode::SHITL_DEMO;    return true; }
+  if (strcmp(line, "MODE,TEST")          == 0) { *out = TeensyMode::TEST;          return true; }
+  if (strcmp(line, "MODE,SENSOR_MOVING") == 0) { *out = TeensyMode::SENSOR_MOVING; return true; }
   return false;
 }
 
@@ -249,6 +260,30 @@ static bool simCalibrated = false;
 static int simCalibrationCount = 0;
 static const int SIM_CAL_SAMPLES = 20;  // ~1s at 50ms loop interval
 
+// Ground truth from the dashboard. When the SHITL dashboard uses the 9-field
+// extended CSV (time, ax, ay, az, pressure, temp, alt_m, vel_ms, phase_code),
+// the Teensy runs its controller on those exact values instead of UKF +
+// state-machine-derived estimates. That makes SHITL_DEMO byte-for-byte
+// identical to the pure-Python demo in controller behavior. The 6-field
+// legacy protocol still works and falls back to UKF + state machine.
+struct SimGroundTruth_t {
+  float sim_time_s = 0.0f;
+  float alt_m = 0.0f;
+  float vel_ms = 0.0f;
+  int phase_code = 0;   // 0=PREFLIGHT, 1=BURN, 2=COAST, 3=DESCENT
+  bool valid = false;   // true when the last frame carried ground truth
+};
+static SimGroundTruth_t SimTruth;
+
+static States phaseCodeToState(int phase_code) {
+  switch (phase_code) {
+    case 1: return States::IGNITION;  // motor burn
+    case 2: return States::ASCENT;    // coast
+    case 3: return States::DESCENT;   // post-apogee
+    case 0: default: return States::IDLE;  // preflight
+  }
+}
+
 // ── Serial Command Handling ──────────────────────────────────────
 
 static void enterSHITL(TeensyMode target) {
@@ -262,13 +297,15 @@ static void enterSHITL(TeensyMode target) {
   RefCalibration.accel_y_bias = 0.0f;  // zeroed before accumulation
   altitudeFilter = UKF1D();
   FlightState.velocity = 0.0f;
+  SimTruth.valid = false;  // new dashboard session → re-detect protocol
+  airbrakeController.reset();
   state = States::IDLE;
   logging.setDebug(true);
   if (target == TeensyMode::SHITL_DEMO) {
     // Park servos once on entry; driveServos() suppresses motion afterwards.
     airbrake_servo_1.setExtension(RocketConfig::SERVO_MIN_PCT);
     airbrake_servo_2.setExtension(RocketConfig::SERVO_MIN_PCT);
-    BrakeState.pct = RocketConfig::SERVO_MIN_PCT;
+    BrakeState.pct = 0.0f;  // 0% airbrake (servos parked at SERVO_MIN_PCT)
   }
   ackMode(target);
   Serial.print(F("Mode: "));
@@ -362,17 +399,20 @@ static bool isDashboardCommand(const char *line) {
 static float readSimulatedSensors() {
   Serial.println("DATAREQUEST");
 
-  char buf[128];
-  float values[6];
-  bool gotSensorData = false;
+  // Extended protocol is 9 fields (legacy is 6):
+  //   time_s, ax, ay, az, pressure_mbar, temp_c, alt_m, vel_ms, phase_code
+  // Bigger buffer so a 9-field line with float formatting never gets split.
+  char buf[192];
+  float values[9];
+  int gotCount = 0;
 
   // Worst case: 3 reads × 25ms = 75ms. Commands cap at 2 so sensor data can't
   // be starved by command spam.
   int commands_handled = 0;
   for (int attempts = 0; attempts < 3; attempts++) {
     int len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
-    buf[len] = '\0';
     if (len == 0) break;
+    buf[len] = '\0';
 
     if (isDashboardCommand(buf)) {
       handleSerialCommand(buf);
@@ -382,20 +422,19 @@ static float readSimulatedSensors() {
 
     int index = 0;
     char *tok = strtok(buf, ",");
-    while (tok && index < 6) {
+    while (tok && index < 9) {
       values[index++] = strtof(tok, nullptr);
       tok = strtok(nullptr, ",");
     }
 
     if (index >= 6 && values[4] > 0.0f) {
-      gotSensorData = true;
+      gotCount = index;
       break;
     }
   }
 
-  if (!gotSensorData) return NAN;
+  if (gotCount < 6) return NAN;
 
-  // Dashboard sends: time_s, 0.0, accel_proper_g, 0.0, pressure_mbar, temp_c
   sensors.accel_x = values[1];
   sensors.accel_y = values[2];
   sensors.accel_z = values[3];
@@ -405,8 +444,20 @@ static float readSimulatedSensors() {
   sensors.accel_y_high_g = sensors.accel_y;
   sensors.accel_z_high_g = sensors.accel_z;
 
-  // Calibrate ground-level reference from the first ~1s of SHITL readings
-  // (SIM_CAL_SAMPLES * 50ms loop). Captures pressure, temp, and accel-Y bias.
+  // Extended protocol: dashboard provided ground truth so the controller runs
+  // on the same inputs as the pure-Python demo. Skip calibration + UKF path.
+  if (gotCount >= 9) {
+    SimTruth.sim_time_s = values[0];
+    SimTruth.alt_m      = values[6];
+    SimTruth.vel_ms     = values[7];
+    SimTruth.phase_code = (int)values[8];
+    SimTruth.valid      = true;
+    return SimTruth.alt_m;
+  }
+
+  // Legacy 6-field path: calibrate ground reference, then derive altitude
+  // from pressure via hypsometric formula.
+  SimTruth.valid = false;
   if (!simCalibrated) {
     RefCalibration.pressure += sensors.pressure;
     RefCalibration.temperature += sensors.temperature + CELSIUS_TO_KELVIN;
@@ -487,7 +538,9 @@ static void runLocalController(float altitude) {
   float vel = FlightState.velocity;
   float alt_msl = altitude + RocketConfig::LAUNCH_SITE_ALT_MSL_M;
   float sos = Atmosphere::speedOfSound(alt_msl);
-  float time_s = millis() / 1000.0f;
+  // When running on dashboard ground truth, use the sim clock so
+  // POST_LAUNCH_DELAY_S etc. line up with Python's sim_time exactly.
+  float time_s = SimTruth.valid ? SimTruth.sim_time_s : millis() / 1000.0f;
   float dt = LOOP_INTERVAL_MS / 1000.0f;
 
   float cd_add = airbrakeController.update(
@@ -513,20 +566,22 @@ static void runFallbackSweep() {
       millis() - FlightState.motor_burnout_time < FALLBACK_BURNOUT_DELAY_MS) {
     return;
   }
+  // BrakeState.pct and AIRBRAKE_MIN/MAX both live in airbrake-% [0..100].
+  // Convert to servo-% only at the driveServos boundary.
   if (millis() - BrakeState.last_update <
       (BrakeState.pct <= AIRBRAKE_MIN ? FALLBACK_SWEEP_PAUSE_MS : FALLBACK_SWEEP_INTERVAL_MS)) {
     return;
   }
   BrakeState.last_update = millis();
-  BrakeState.pct += FALLBACK_SWEEP_STEP * BrakeState.direction;
-  if (BrakeState.pct >= AIRBRAKE_MAX) {
-    BrakeState.pct = AIRBRAKE_MAX;
+  float airbrake_pct = BrakeState.pct + FALLBACK_SWEEP_STEP * BrakeState.direction;
+  if (airbrake_pct >= AIRBRAKE_MAX) {
+    airbrake_pct = AIRBRAKE_MAX;
     BrakeState.direction = -2;
-  } else if (BrakeState.pct <= AIRBRAKE_MIN) {
-    BrakeState.pct = AIRBRAKE_MIN;
+  } else if (airbrake_pct <= AIRBRAKE_MIN) {
+    airbrake_pct = AIRBRAKE_MIN;
     BrakeState.direction = 1;
   }
-  driveServos(BrakeState.pct);
+  driveServos(RocketConfig::airbrakePctToServoPct(airbrake_pct));
 }
 
 // ── Mode-Specific Loop Functions ─────────────────────────────────
@@ -562,22 +617,57 @@ static void loopSHITL() {
   float raw_alt = readSimulatedSensors();
   if (isnan(raw_alt)) return;
 
-  float altitude = isOnPad() ? 0.0f : filterAltitude(raw_alt);
-
-  updateStateMachine(altitude);
-
-  if (state == States::IGNITION || state == States::ASCENT) {
-    runLocalController(altitude);
+  float altitude;
+  if (SimTruth.valid) {
+    // Ground-truth path: controller runs on the same inputs as the
+    // pure-Python demo, so SHITL_DEMO and SHITL produce identical commands
+    // to the non-Teensy demo. SHITL still drives servos; SHITL_DEMO parks.
+    state = phaseCodeToState(SimTruth.phase_code);
+    altitude = SimTruth.alt_m;
+    FlightState.velocity = SimTruth.vel_ms;
+    FlightState.max_altitude = fmaxf(FlightState.max_altitude, altitude);
+  } else {
+    // Legacy 6-field protocol: UKF + state machine derive alt/vel/state
+    // from sensor data.
+    altitude = isOnPad() ? 0.0f : filterAltitude(raw_alt);
+    updateStateMachine(altitude);
   }
+
+  // Call the controller every tick — it internally retracts in PREFLIGHT/BURN.
+  // Matches how the Python demo invokes AirbrakeController.update every step.
+  runLocalController(altitude);
 
   logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
 }
 
 static void loopTest() {
+  // Explicit LED every tick so mode switches out of SHITL (rainbow PWM) don't
+  // leave the LED frozen on the last PWM frame.
+  statusIndicator.solid(StatusIndicator::BLUE);
+
   float raw_alt = readRealSensors();
   if (isnan(raw_alt)) return;
 
   // Filter unconditionally — TEST mode exists to expose UKF behavior for tuning.
+  float altitude = filterAltitude(raw_alt);
+
+  checkSerialCommands();
+  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
+}
+
+// SENSOR_MOVING: real sensors + UKF, no state machine, no servo motion.
+// Intended for picking up / moving / shaking the rocket on the ground to
+// watch the state estimate (altitude, velocity, acceleration) and capture
+// a file to SD in the same CSV format as FLIGHT. Servos stay parked at
+// SERVO_MIN_PCT (set during setup()); this loop never calls driveServos.
+static void loopSensorMoving() {
+  // Solid ORANGE distinguishes SENSOR_MOVING from TEST (BLUE) and IDLE (GREEN).
+  // Driven every tick so switching out of SHITL (rainbow PWM) updates cleanly.
+  statusIndicator.solid(StatusIndicator::ORANGE);
+
+  float raw_alt = readRealSensors();
+  if (isnan(raw_alt)) return;
+
   float altitude = filterAltitude(raw_alt);
 
   checkSerialCommands();
@@ -660,7 +750,7 @@ void setup() {
   // Park at mechanical minimum instead of the Bilda default (0%).
   airbrake_servo_1.setExtension(RocketConfig::SERVO_MIN_PCT);
   airbrake_servo_2.setExtension(RocketConfig::SERVO_MIN_PCT);
-  BrakeState.pct = RocketConfig::SERVO_MIN_PCT;
+  BrakeState.pct = 0.0f;  // 0% airbrake (servos parked at SERVO_MIN_PCT)
 
   // Set initial state
   if (failed_sensors > 0 && !isSimMode(currentMode)) {
@@ -682,9 +772,10 @@ void loop() {
   last_loop_time = now;
 
   switch (currentMode) {
-    case TeensyMode::FLIGHT:     loopFlight(); break;
+    case TeensyMode::FLIGHT:        loopFlight();       break;
     case TeensyMode::SHITL:
-    case TeensyMode::SHITL_DEMO: loopSHITL();  break;
-    case TeensyMode::TEST:       loopTest();   break;
+    case TeensyMode::SHITL_DEMO:    loopSHITL();        break;
+    case TeensyMode::TEST:          loopTest();         break;
+    case TeensyMode::SENSOR_MOVING: loopSensorMoving(); break;
   }
 }

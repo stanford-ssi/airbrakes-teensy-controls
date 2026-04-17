@@ -23,7 +23,7 @@ static States handleIdle() {
         abs(sensors.accel_y) > abs(sensors.accel_z)) {
       BrakeState.direction = 1;
       BrakeState.last_update = 0;
-      BrakeState.pct = AIRBRAKE_MIN;
+      BrakeState.pct = AIRBRAKE_MIN;  // airbrake-% (0 = retracted)
       return States::AIRBRAKE_TEST;
     }
     BrakeState.hasCheckedForHorizontal = true;
@@ -35,18 +35,20 @@ static States handleIdle() {
 static States handleAirbrakeTest() {
   statusIndicator.solid(StatusIndicator::BLUE);
 
+  // BrakeState.pct and AIRBRAKE_MIN/MAX both live in airbrake-% [0..100].
+  // Convert to servo-% only at the driveServos boundary.
   if (millis() - BrakeState.last_update >=
       (BrakeState.pct <= AIRBRAKE_MIN ? TEST_SWEEP_PAUSE_MS : TEST_SWEEP_INTERVAL_MS)) {
     BrakeState.last_update = millis();
-    BrakeState.pct += TEST_SWEEP_STEP * BrakeState.direction;
-    if (BrakeState.pct >= AIRBRAKE_MAX) {
-      BrakeState.pct = AIRBRAKE_MAX;
+    float airbrake_pct = BrakeState.pct + TEST_SWEEP_STEP * BrakeState.direction;
+    if (airbrake_pct >= AIRBRAKE_MAX) {
+      airbrake_pct = AIRBRAKE_MAX;
       BrakeState.direction = -1;
-    } else if (BrakeState.pct <= AIRBRAKE_MIN) {
-      BrakeState.pct = AIRBRAKE_MIN;
+    } else if (airbrake_pct <= AIRBRAKE_MIN) {
+      airbrake_pct = AIRBRAKE_MIN;
       BrakeState.direction = 1;
     }
-    driveServos(BrakeState.pct);
+    driveServos(RocketConfig::airbrakePctToServoPct(airbrake_pct));
   }
 
   return States::AIRBRAKE_TEST;
