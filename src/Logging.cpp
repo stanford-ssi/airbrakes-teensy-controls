@@ -94,7 +94,7 @@ void Logging::flush() {
   }
 }
 
-void Logging::logTelemetry(float altitude, const SensorData_t &sens, const BrakeState_t &brake, const I2CControl_t &i2c, States st) {
+void Logging::logTelemetry(float altitude, float velocity, const SensorData_t &sens, const BrakeState_t &brake, const I2CControl_t &i2c, States st) {
   LogBuffer buf;
   buf.appendLong(millis());
   buf.field(sens.accel_x);
@@ -121,6 +121,7 @@ void Logging::logTelemetry(float altitude, const SensorData_t &sens, const Brake
   buf.field(i2c.fallback ? 1 : 0);
   buf.field(i2c.failCount);
   buf.field((int)sens.potentiometer_value);
+  buf.field(velocity);
   log(buf.str());
 
   if (millis() - lastFlush > 1000) {

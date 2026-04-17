@@ -1,24 +1,26 @@
 #pragma once
 
 namespace RocketConfig {
-    // Mass properties
-    constexpr float MASS_KG = 18.9f;
+    // Mass properties (V2 rocket — matches SHITL dashboard sim)
+    constexpr float MASS_KG = 23.28f;
 
-    // Aerodynamic properties (from CFD LookupTableV1.csv)
-    constexpr float BODY_CD = 0.53f;        // Body drag coefficient at angle=1° (~Mach 0.45)
-    constexpr float MAX_CD = 2.01f;         // Maximum total Cd (angle=95°, Mach 0.8)
-    constexpr float MAX_CD_ADD = MAX_CD - BODY_CD;  // Max additional Cd from airbrakes (~1.48)
-    constexpr float REF_AREA_M2 = 0.008107f; // Reference cross-section area
+    // Aerodynamic properties (V2 rocket — flat-plate airbrake model)
+    constexpr float BODY_CD = 0.364f;       // Representative body Cd (V2 Cd-vs-Mach midpoint)
+    // CFD table gives cd_add up to ~1.41 (mach 0.1) ... ~1.50 (mach 0.8) at 95° deploy.
+    // 1.5 lets the inverse lookup naturally saturate to ANGLE_MAX (100% servo) when commanded full.
+    constexpr float MAX_CD_ADD = 1.5f;
+    constexpr float MAX_CD = BODY_CD + MAX_CD_ADD;
+    constexpr float REF_AREA_M2 = 0.01929f; // Reference cross-section area (V2 diameter 0.15672m)
 
     // Target altitude
-    constexpr float TARGET_ALT_AGL_M = 8991.0f;  // 30,000 ft
-    constexpr float MAX_TARGET_ALT_M = 8991.0f;  // 30,000 ft (IREC max)
+    constexpr float TARGET_ALT_AGL_M = 9144.0f;  // 30,000 ft
+    constexpr float MAX_TARGET_ALT_M = 9144.0f;  // 30,000 ft (IREC max)
 
     // Launch site
-    constexpr float LAUNCH_SITE_ALT_MSL_M = 823.0f; // FAR (Mojave)
+    constexpr float LAUNCH_SITE_ALT_MSL_M = 630.9f; // FAR (Mojave) 2070 ft MSL
 
     // Controller limits
-    constexpr float SERVO_MIN_PCT = 0.0f;    // Minimum servo extension (%)
+    constexpr float SERVO_MIN_PCT = 20.0f;   // Minimum servo extension (%) — mechanical park position, never commanded below this
     constexpr float SERVO_MAX_PCT = 100.0f;  // Maximum servo extension (%)
     constexpr float CD_SLEW_RATE_MAX = 1.5f; // Max Cd change rate (Cd/s)
 

@@ -47,7 +47,7 @@ private:
     bool initialized_;
 
     // Merwe's scaled sigma point parameters
-    static constexpr float ALPHA = 1e-3f;
+    static constexpr float ALPHA = 0.1f;
     static constexpr float BETA = 2.0f;
     static constexpr float KAPPA = 0.0f;
     static constexpr float LAMBDA = ALPHA * ALPHA * (N + KAPPA) - N;

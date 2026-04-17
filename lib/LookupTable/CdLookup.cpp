@@ -134,13 +134,21 @@ float CdLookup::servoPctToAngleDeg(float servo_pct) {
 }
 
 ServoAngles CdLookup::cdToServoAngles(float cd_add, float mach) {
-    if (cd_add < 0.0f) cd_add = 0.0f;
-    if (cd_add > RocketConfig::MAX_CD_ADD) cd_add = RocketConfig::MAX_CD_ADD;
+    ServoAngles result;
+
+    if (cd_add <= 0.0f) {
+        result.angle_1 = RocketConfig::SERVO_MIN_PCT;
+        result.angle_2 = RocketConfig::SERVO_MIN_PCT;
+        return result;
+    }
+
+    // No upper clamp: inverseLookupAngle naturally saturates to ANGLE_MAX when cd_add
+    // exceeds what the CFD table yields at this mach, so max-brake commands hit 100%.
 
     float angle_deg = inverseLookupAngle(cd_add, mach);
     float servo_pct = angleDegToServoPct(angle_deg);
+    if (servo_pct < RocketConfig::SERVO_MIN_PCT) servo_pct = RocketConfig::SERVO_MIN_PCT;
 
-    ServoAngles result;
     result.angle_1 = servo_pct;
     result.angle_2 = servo_pct;  // Mirrored for now
     return result;

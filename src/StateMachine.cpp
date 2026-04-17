@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Globals.h>
+#include <PhysicsConstants.h>
+#include <RocketConfig.h>
 
 static States handleSensorError() {
   statusIndicator.solid(StatusIndicator::WHITE);
@@ -44,8 +46,7 @@ static States handleAirbrakeTest() {
       BrakeState.pct = AIRBRAKE_MIN;
       BrakeState.direction = 1;
     }
-    airbrake_servo_1.setExtension(BrakeState.pct);
-    airbrake_servo_2.setExtension(BrakeState.pct);
+    driveServos(BrakeState.pct);
   }
 
   return States::AIRBRAKE_TEST;
@@ -53,8 +54,6 @@ static States handleAirbrakeTest() {
 
 static States handleIgnition() {
   statusIndicator.solid(StatusIndicator::ORANGE);
-
-  FlightState.velocity += (sensors.accel_y_high_g - 1.0f) * 9.81f * (LOOP_INTERVAL_MS / 1000.0f);
 
   if (sensors.accel_y < 0) {
     FlightState.motor_burnout_time = millis();
@@ -65,39 +64,12 @@ static States handleIgnition() {
 }
 
 static int apogeeConfirmCount = 0;
-static const int APOGEE_CONFIRM_THRESHOLD = 5;  // require 5 consecutive altitude decreases (~250ms)
+static const int APOGEE_CONFIRM_THRESHOLD = 5;  // ~250ms of monotonic altitude decrease
 
 static States handleAscent(float altitude) {
   statusIndicator.solid(StatusIndicator::RED);
 
   FlightState.max_altitude = max(FlightState.max_altitude, altitude);
-
-  if (!USE_CONTROL || I2CControl.fallback) {
-    if (millis() - FlightState.ignition_time > FALLBACK_IGNITION_DELAY_MS ||
-        millis() - FlightState.motor_burnout_time > FALLBACK_BURNOUT_DELAY_MS) {
-      if (millis() - BrakeState.last_update >=
-          (BrakeState.pct <= AIRBRAKE_MIN ? FALLBACK_SWEEP_PAUSE_MS : FALLBACK_SWEEP_INTERVAL_MS)) {
-        BrakeState.last_update = millis();
-        BrakeState.pct += FALLBACK_SWEEP_STEP * BrakeState.direction;
-        if (BrakeState.pct >= AIRBRAKE_MAX) {
-          BrakeState.pct = AIRBRAKE_MAX;
-          BrakeState.direction = -2;
-        } else if (BrakeState.pct <= AIRBRAKE_MIN) {
-          BrakeState.pct = AIRBRAKE_MIN;
-          BrakeState.direction = 1;
-        }
-        airbrake_servo_1.setExtension(BrakeState.pct);
-        airbrake_servo_2.setExtension(BrakeState.pct);
-      }
-    }
-  } else {
-    sendControlPacket(altitude);
-    airbrake_servo_1.setExtension(I2CControl.cmd_servo_1);
-    airbrake_servo_2.setExtension(I2CControl.cmd_servo_2);
-    BrakeState.pct = I2CControl.cmd_servo_1;
-  }
-
-  FlightState.velocity += (sensors.accel_y_high_g - 1.0f) * 9.81f * (LOOP_INTERVAL_MS / 1000.0f);
 
   bool machLockout = FlightState.velocity > MACH_LOCKOUT_VELOCITY;
   bool altDecreasing = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);
@@ -111,10 +83,7 @@ static States handleAscent(float altitude) {
   }
 
   if (apogeeConfirmCount >= APOGEE_CONFIRM_THRESHOLD || timedOut) {
-    airbrake_servo_1.setExtension(AIRBRAKE_MIN);
-    airbrake_servo_2.setExtension(AIRBRAKE_MIN);
-    BrakeState.pct = AIRBRAKE_MIN;
-    BrakeState.direction = 1;
+    driveServos(RocketConfig::SERVO_MIN_PCT);
     FlightState.fire_time = millis();
     return States::APOGEE;
   }

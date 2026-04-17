@@ -8,8 +8,8 @@ UKF1D::UKF1D() : initialized_(false) {
     memset(Q_, 0, sizeof(Q_));
     computeWeights();
 
-    // Default process noise
-    setProcessNoise(0.1f, 0.5f, 1.0f);
+    // Default process noise (std devs per step)
+    setProcessNoise(0.05f, 0.2f, 0.3f);
 }
 
 void UKF1D::computeWeights() {

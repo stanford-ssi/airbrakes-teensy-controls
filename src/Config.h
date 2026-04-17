@@ -9,8 +9,8 @@ const int I2C_FAIL_THRESHOLD = 10;
 // Loop timing
 const unsigned long LOOP_INTERVAL_MS = 50;
 
-// Airbrake limits
-const float AIRBRAKE_MIN = 10.0;
+// Airbrake limits (sweep/test bounds — must stay >= RocketConfig::SERVO_MIN_PCT)
+const float AIRBRAKE_MIN = 20.0;
 const float AIRBRAKE_MAX = 60.0;
 
 // State machine thresholds
@@ -29,6 +29,6 @@ const unsigned long FALLBACK_SWEEP_INTERVAL_MS = 1000;   // normal sweep interva
 const float FALLBACK_SWEEP_STEP = 25.0;                  // percent per step
 
 // Airbrake test sweep
-const unsigned long TEST_SWEEP_PAUSE_MS = 3000;  // pause at min position
-const unsigned long TEST_SWEEP_INTERVAL_MS = 1000;
-const float TEST_SWEEP_STEP = 25.0;  // percent per step
+const unsigned long TEST_SWEEP_PAUSE_MS = 50;    // minimal pause at min position
+const unsigned long TEST_SWEEP_INTERVAL_MS = 50;  // step every loop tick for continuous motion
+const float TEST_SWEEP_STEP = 5.0;               // percent per step (smooth sweep)

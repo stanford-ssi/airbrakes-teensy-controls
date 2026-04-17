@@ -11,6 +11,7 @@ class StatusIndicator {
 
   void flash(Color color, int durationMs);
   void solid(Color color);
+  void rainbow();
   void off();
 
  private:

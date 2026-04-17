@@ -15,7 +15,7 @@ struct LogBuffer {
   }
 
   void appendFloat(float v, int decimals = 2) {
-    char tmp[16];
+    char tmp[24];
     dtostrf(v, 0, decimals, tmp);
     appendStr(tmp);
   }
@@ -44,10 +44,12 @@ class Logging {
  public:
   Logging(bool debug, bool logToSD, int SD_CS);
 
+  void setDebug(bool d) { debug = d; }  // enable serial output at runtime (for SHITL)
+
   void log(const char* message, bool newline = true);
   bool begin();
   void flush();
-  void logTelemetry(float altitude, const SensorData_t& sens,
+  void logTelemetry(float altitude, float velocity, const SensorData_t& sens,
                     const BrakeState_t& brake, const I2CControl_t& i2c,
                     States st);
 

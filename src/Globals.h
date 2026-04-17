@@ -24,9 +24,9 @@ struct BrakeState_t {
 };
 
 struct FlightState_t {
-  int ignition_time = 0;
-  int motor_burnout_time = 0;
-  int fire_time = 0;
+  unsigned long ignition_time = 0;
+  unsigned long motor_burnout_time = 0;
+  unsigned long fire_time = 0;
   float max_altitude = 0.0f;
   float prev_altitude = 0.0f;
   float velocity = 0.0f;  // m/s, integrated from ignition
@@ -53,3 +53,6 @@ extern Bilda airbrake_servo_2;
 extern Igniter primaryIgniter;
 
 void sendControlPacket(float altitude);
+
+// Physical servo motion is suppressed in SHITL_DEMO; BrakeState.pct is always updated.
+void driveServos(float pct);
