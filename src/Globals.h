@@ -40,6 +40,11 @@ struct I2CControl_t {
   float cmd_servo_2 = 0.0f;
   float predicted_apogee = 0.0f;
   float cd_add_cmd = 0.0f;
+  // Predictor diagnostics logged to telemetry so the dashboard can cross-check
+  // the Teensy's binary-search predictor against the Python port.
+  float target_cd_raw = 0.0f;    // predictor's cd_add before slew limiting
+  float apo_no_brakes = 0.0f;    // predictor's apogee with cd_add = 0
+  float apo_max_brakes = 0.0f;   // predictor's apogee with cd_add = MAX_CD_ADD
 };
 
 extern SensorData_t sensors;

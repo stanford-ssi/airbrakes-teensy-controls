@@ -27,21 +27,26 @@ float ApogeePredictor::simulateCoast(float alt_agl, float vel, float cd_add,
     float dt = RocketConfig::RK4_DT;
     float t = 0.0f;
 
-    // Body Cd is Mach-dependent, recompute as the rocket decelerates
+    // Body Cd is Mach-dependent, recompute as the rocket decelerates. Brake
+    // contribution is gated by MACH_DEPLOY_LIMIT to match the Python sim:
+    // airbrakes cannot deploy at/above Mach 1, so cd_add is zeroed there.
     float alt_msl = h + launch_site_alt_msl;
     float sos = Atmosphere::speedOfSound(alt_msl);
     float mach = fabsf(v) / sos;
-    float cd_total = CdLookup::bodyCd(mach) + cd_add;
+    float brake_cd = (mach < RocketConfig::MACH_DEPLOY_LIMIT) ? cd_add : 0.0f;
+    float cd_total = CdLookup::bodyCd(mach) + brake_cd;
 
     int step = 0;
 
     while (v > 0.0f && t < RocketConfig::MAX_SIM_TIME) {
-        // Refresh Cd every 5 RK4 steps to track Mach changes
+        // Refresh Cd every 5 RK4 steps to track Mach changes (and cross the
+        // Mach 1 deploy gate when the rocket drops below it during coast).
         if (step % 5 == 0) {
             alt_msl = h + launch_site_alt_msl;
             sos = Atmosphere::speedOfSound(alt_msl);
             mach = fabsf(v) / sos;
-            cd_total = CdLookup::bodyCd(mach) + cd_add;
+            brake_cd = (mach < RocketConfig::MACH_DEPLOY_LIMIT) ? cd_add : 0.0f;
+            cd_total = CdLookup::bodyCd(mach) + brake_cd;
         }
 
         // RK4 integration
@@ -88,6 +93,8 @@ ApogeePredictor::Result ApogeePredictor::predict(float alt_agl, float vel,
                                                    float launch_site_alt_msl,
                                                    float target_alt_agl) {
     Result result;
+    result.apo_no_brakes = alt_agl;
+    result.apo_max_brakes = alt_agl;
 
     // Already descending, nothing to predict
     if (vel <= 0.0f) {
@@ -101,23 +108,24 @@ ApogeePredictor::Result ApogeePredictor::predict(float alt_agl, float vel,
     float cd_high = RocketConfig::MAX_CD_ADD;
 
     // First check: can we even reach target with no brakes?
-    float apogee_no_brakes = simulateCoast(alt_agl, vel, 0.0f,
-                                            launch_site_alt_msl);
+    result.apo_no_brakes = simulateCoast(alt_agl, vel, 0.0f,
+                                          launch_site_alt_msl);
 
-    if (apogee_no_brakes <= target_alt_agl) {
+    if (result.apo_no_brakes <= target_alt_agl) {
         // Can't reach target even without brakes, retract
-        result.predicted_apogee = apogee_no_brakes;
+        result.predicted_apogee = result.apo_no_brakes;
         result.cd_add = 0.0f;
+        result.apo_max_brakes = result.apo_no_brakes;
         return result;
     }
 
     // Check: does max braking undershoot?
-    float apogee_max_brakes = simulateCoast(alt_agl, vel, cd_high,
-                                             launch_site_alt_msl);
+    result.apo_max_brakes = simulateCoast(alt_agl, vel, cd_high,
+                                           launch_site_alt_msl);
 
-    if (apogee_max_brakes >= target_alt_agl) {
+    if (result.apo_max_brakes >= target_alt_agl) {
         // Even full brakes overshoot target, deploy max
-        result.predicted_apogee = apogee_max_brakes;
+        result.predicted_apogee = result.apo_max_brakes;
         result.cd_add = cd_high;
         return result;
     }

@@ -62,6 +62,39 @@ static const char* modeToString(TeensyMode m) {
   return "UNKNOWN";
 }
 
+// Audible confirmation the Teensy booted in FLIGHT mode. 5 on/off cycles of
+// 500 ms each = 5 s total, using tone() so it works with both passive and
+// active buzzers.
+static void flightModeBuzzerConfirm() {
+  const int BEEP_FREQ_HZ = 2000;
+  const int BEEP_HALF_PERIOD_MS = 500;
+  const int BEEP_CYCLES = 5;
+  for (int i = 0; i < BEEP_CYCLES; i++) {
+    tone(PinDefs.BUZZER, BEEP_FREQ_HZ);
+    delay(BEEP_HALF_PERIOD_MS);
+    noTone(PinDefs.BUZZER);
+    digitalWrite(PinDefs.BUZZER, LOW);
+    delay(BEEP_HALF_PERIOD_MS);
+  }
+}
+
+// Audible confirmation the USB cable was unplugged while in FLIGHT mode and
+// the Teensy is now running on internal battery power. 8 cycles × 250 ms on /
+// 250 ms off = 4 s total. The tighter cadence (vs the 5-beep flight-mode
+// confirm) makes it unambiguous by ear which event just fired.
+static void internalPowerBuzzerConfirm() {
+  const int BEEP_FREQ_HZ = 2000;
+  const int BEEP_HALF_PERIOD_MS = 250;
+  const int BEEP_CYCLES = 8;
+  for (int i = 0; i < BEEP_CYCLES; i++) {
+    tone(PinDefs.BUZZER, BEEP_FREQ_HZ);
+    delay(BEEP_HALF_PERIOD_MS);
+    noTone(PinDefs.BUZZER);
+    digitalWrite(PinDefs.BUZZER, LOW);
+    delay(BEEP_HALF_PERIOD_MS);
+  }
+}
+
 // ── Hardware ─────────────────────────────────────────────────────
 Adxl adxl345 = Adxl(0x1D, ADXL345);
 Adxl adxl375 = Adxl(0x53, ADXL375);
@@ -93,17 +126,18 @@ unsigned long last_loop_time = 0;
 static struct {
   float pressure = 0;
   float temperature = 0;
-  // Accel-Y reading at rest (gravity). Defaults to ideal 1g; ZERO re-measures
-  // it so residual sensor bias doesn't integrate into phantom velocity drift.
-  float accel_y_bias = 1.0f;
+  // Accel-Z reading at rest (gravity on the thrust axis). Defaults to ideal 1g;
+  // ZERO re-measures it so residual sensor bias doesn't integrate into phantom
+  // velocity drift.
+  float accel_z_bias = 1.0f;
 } RefCalibration;
 
 // ── Sensor Helpers ───────────────────────────────────────────────
 
 // Samples real sensors over ~1 second to capture the at-rest baseline.
-// Pressure/temperature become the altitude reference; accel-Y bias subtracts
-// the resting-gravity reading so the filter doesn't drift when the rocket is
-// actually stationary.
+// Pressure/temperature become the altitude reference; accel-Z bias subtracts
+// the resting-gravity reading on the thrust axis so the filter doesn't drift
+// when the rocket is actually stationary.
 static void calibrateSensors(Lps22 &lps, Adxl *lg_accel = nullptr) {
   delay(100);
   const int N = 40;  // 40 samples × 25 ms = 1 s
@@ -118,7 +152,7 @@ static void calibrateSensors(Lps22 &lps, Adxl *lg_accel = nullptr) {
     if (p > 0.0f) {
       p_sum += p;
       t_sum += t;
-      a_sum += ay;
+      a_sum += az;
       valid++;
     }
     delay(25);
@@ -126,7 +160,7 @@ static void calibrateSensors(Lps22 &lps, Adxl *lg_accel = nullptr) {
   if (valid > 0) {
     RefCalibration.pressure = p_sum / (float)valid;
     RefCalibration.temperature = t_sum / (float)valid + CELSIUS_TO_KELVIN;
-    if (lg_accel) RefCalibration.accel_y_bias = a_sum / (float)valid;
+    if (lg_accel) RefCalibration.accel_z_bias = a_sum / (float)valid;
   }
 }
 
@@ -180,9 +214,9 @@ static float filterAltitude(float raw_alt) {
   // (no predict between them) but half the compute cost. Subtract the measured
   // at-rest bias (from ZERO calibration) instead of an ideal 1g, so residual
   // sensor bias doesn't accumulate into phantom velocity drift.
-  float bias = RefCalibration.accel_y_bias;
-  float a_low  = (sensors.accel_y         - bias) * g0;
-  float a_high = (sensors.accel_y_high_g  - bias) * g0;
+  float bias = RefCalibration.accel_z_bias;
+  float a_low  = (sensors.accel_z         - bias) * g0;
+  float a_high = (sensors.accel_z_high_g  - bias) * g0;
   float inv_R_low  = 1.0f / w.R_accel_low;
   float inv_R_high = 1.0f / w.R_accel_high;
   float inv_R_sum  = inv_R_low + inv_R_high;
@@ -294,7 +328,7 @@ static void enterSHITL(TeensyMode target) {
   simCalibrationCount = 0;
   RefCalibration.pressure = 0;
   RefCalibration.temperature = 0;
-  RefCalibration.accel_y_bias = 0.0f;  // zeroed before accumulation
+  RefCalibration.accel_z_bias = 0.0f;  // zeroed before accumulation
   altitudeFilter = UKF1D();
   FlightState.velocity = 0.0f;
   SimTruth.valid = false;  // new dashboard session → re-detect protocol
@@ -318,8 +352,19 @@ static void handleSerialCommand(const char *line) {
     if (isSimMode(m)) {
       enterSHITL(m);
     } else {
+      // Beep the buzzer on a *transition* into FLIGHT (e.g. dashboard
+      // promoting the Teensy from SHITL to live). Only fires from ground
+      // states so we never burn 5 s of the main loop mid-flight.
+      bool entering_flight =
+          (m == TeensyMode::FLIGHT) && (currentMode != TeensyMode::FLIGHT);
       currentMode = m;
       ackMode(m);
+      if (entering_flight && state != States::SENSOR_ERROR &&
+          (state == States::IDLE || state == States::AIRBRAKE_TEST ||
+           state == States::BOOT || state == States::LANDED)) {
+        Serial.println(F("FLIGHT mode -- buzzer confirm"));
+        flightModeBuzzerConfirm();
+      }
     }
     return;
   }
@@ -339,8 +384,8 @@ static void handleSerialCommand(const char *line) {
     FlightState.velocity = 0.0f;
     Serial.print(F("Zeroed: p_ref="));
     Serial.print(RefCalibration.pressure, 2);
-    Serial.print(F(" mbar, accel_y_bias="));
-    Serial.print(RefCalibration.accel_y_bias, 4);
+    Serial.print(F(" mbar, accel_z_bias="));
+    Serial.print(RefCalibration.accel_z_bias, 4);
     Serial.println(F(" g"));
   } else if (strcmp(line, "RESET") == 0) {
     Serial.println(F("RESET_ACK"));
@@ -461,17 +506,17 @@ static float readSimulatedSensors() {
   if (!simCalibrated) {
     RefCalibration.pressure += sensors.pressure;
     RefCalibration.temperature += sensors.temperature + CELSIUS_TO_KELVIN;
-    RefCalibration.accel_y_bias += sensors.accel_y;
+    RefCalibration.accel_z_bias += sensors.accel_z;
     simCalibrationCount++;
     if (simCalibrationCount >= SIM_CAL_SAMPLES) {
       RefCalibration.pressure /= (float)SIM_CAL_SAMPLES;
       RefCalibration.temperature /= (float)SIM_CAL_SAMPLES;
-      RefCalibration.accel_y_bias /= (float)SIM_CAL_SAMPLES;
+      RefCalibration.accel_z_bias /= (float)SIM_CAL_SAMPLES;
       simCalibrated = true;
       Serial.print(F("SHITL calibrated: p_ref="));
       Serial.print(RefCalibration.pressure, 2);
-      Serial.print(F(" mbar, accel_y_bias="));
-      Serial.print(RefCalibration.accel_y_bias, 4);
+      Serial.print(F(" mbar, accel_z_bias="));
+      Serial.print(RefCalibration.accel_z_bias, 4);
       Serial.println(F(" g"));
     }
     return NAN;
@@ -490,8 +535,8 @@ void sendControlPacket(float altitude) {
   controlPacket.time_ms = millis();
   controlPacket.pressure = sensors.pressure;
   controlPacket.temperature = sensors.temperature;
-  controlPacket.accel_z_low_g = sensors.accel_y;
-  controlPacket.accel_z_high_g = sensors.accel_y_high_g;
+  controlPacket.accel_z_low_g = sensors.accel_z;
+  controlPacket.accel_z_high_g = sensors.accel_z_high_g;
   controlPacket.baro_altitude = altitude;
   controlPacket.flight_state = static_cast<uint8_t>(state);
   controlPacket.crc = computeControlCRC((uint8_t *)&controlPacket, sizeof(controlPacket) - 1);
@@ -544,7 +589,7 @@ static void runLocalController(float altitude) {
   float dt = LOOP_INTERVAL_MS / 1000.0f;
 
   float cd_add = airbrakeController.update(
-      altitude, vel, sensors.accel_y * g0,
+      altitude, vel, sensors.accel_z * g0,
       static_cast<uint8_t>(state), sos, time_s, dt);
 
   float mach = fabsf(vel) / sos;
@@ -554,6 +599,9 @@ static void runLocalController(float altitude) {
   I2CControl.cmd_servo_2 = angles.angle_2;
   I2CControl.predicted_apogee = airbrakeController.predictedApogee();
   I2CControl.cd_add_cmd = cd_add;
+  I2CControl.target_cd_raw = airbrakeController.lastTargetCdRaw();
+  I2CControl.apo_no_brakes = airbrakeController.lastApoNoBrakes();
+  I2CControl.apo_max_brakes = airbrakeController.lastApoMaxBrakes();
 
   driveServos(angles.angle_1);
 }
@@ -682,6 +730,8 @@ void setup() {
   pinMode(PinDefs.ARM, INPUT_PULLUP);
   pinMode(PinDefs.IGNITER_0, OUTPUT);
   pinMode(PinDefs.IGNITER_1, OUTPUT);
+  pinMode(PinDefs.BUZZER, OUTPUT);
+  digitalWrite(PinDefs.BUZZER, LOW);  // silent until flight-mode confirm beep
 
   // Wait for USB serial with timeout -- flight continues without USB host
   unsigned long serialWaitStart = millis();
@@ -706,13 +756,23 @@ void setup() {
 
   delay(4000);  // allow sensors to power up
 
-  // SD card
-  while (!logging.begin()) {
-    statusIndicator.solid(StatusIndicator::RED);
-    Serial.println(F("Waiting for SD card..."));
-    delay(1000);
+  // SD card — retry for ~10 s, then continue so a missing card doesn't
+  // strand the Teensy on the pad with a RED LED. Flight still works; only
+  // the SD log is lost.
+  bool sd_ok = false;
+  for (int i = 0; i < 10 && !sd_ok; i++) {
+    sd_ok = logging.begin();
+    if (!sd_ok) {
+      statusIndicator.solid(StatusIndicator::RED);
+      Serial.println(F("Waiting for SD card..."));
+      delay(1000);
+    }
   }
-  Serial.println(F("SD card initialized"));
+  if (sd_ok) {
+    Serial.println(F("SD card initialized"));
+  } else {
+    Serial.println(F("SD card init failed -- continuing without log"));
+  }
 
   // Initialize real sensors for FLIGHT and TEST modes
   if (!isSimMode(currentMode)) {
@@ -741,7 +801,8 @@ void setup() {
       "Time,Xg,Yg,Zg,Xg_high,Yg_high,Zg_high,Pressure,Temperature,Altitude,"
       "BNO_X,BNO_Y,BNO_Z,BNO_I,BNO_J,BNO_K,BNO_Real,State,"
       "Airbrake_pct,Airbrake_dir,Predicted_Apogee,Cd_Add_Cmd,"
-      "I2C_Fallback,I2C_FailCount,Potentiometer,Velocity");
+      "I2C_Fallback,I2C_FailCount,Potentiometer,Velocity,"
+      "Target_Cd_Raw,Apo_No_Brakes,Apo_Max_Brakes");
   logging.flush();
 
   // Servo init LAST -- SD.begin() internally calls SPI.begin() which claims pin 10
@@ -762,6 +823,13 @@ void setup() {
     Serial.println(F("Setup complete"));
     state = States::IDLE;
   }
+
+  // FLIGHT mode confirmation: 5 on/off buzzer cycles over 5 s. Skip on
+  // SENSOR_ERROR so the WHITE LED + silence unambiguously flags the fault.
+  if (currentMode == TeensyMode::FLIGHT && state != States::SENSOR_ERROR) {
+    Serial.println(F("FLIGHT mode -- buzzer confirm"));
+    flightModeBuzzerConfirm();
+  }
 }
 
 // ── Main Loop ────────────────────────────────────────────────────
@@ -770,6 +838,21 @@ void loop() {
   unsigned long now = millis();
   if (now - last_loop_time < LOOP_INTERVAL_MS) return;
   last_loop_time = now;
+
+  // USB-unplug watcher (FLIGHT mode only). When the laptop cable is pulled
+  // before launch, announce "on internal power" with 8 short beeps so the
+  // operator has an audible confirmation that the Teensy is still running on
+  // battery and the state handlers are still refreshing the LED. Only fires
+  // from ground states so we never burn ~4 s of the main loop mid-flight if
+  // the connector happens to rip loose under motor g-load.
+  static bool usbWasConnected = false;
+  bool usbNow = (bool)Serial;
+  if (currentMode == TeensyMode::FLIGHT && usbWasConnected && !usbNow &&
+      (state == States::IDLE || state == States::AIRBRAKE_TEST ||
+       state == States::BOOT || state == States::LANDED)) {
+    internalPowerBuzzerConfirm();
+  }
+  usbWasConnected = usbNow;
 
   switch (currentMode) {
     case TeensyMode::FLIGHT:        loopFlight();       break;

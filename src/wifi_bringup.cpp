@@ -43,12 +43,12 @@
 // AirLift breakout's MOSI/MISO/SCK pads must be wired to those Teensy pins
 // for hardware SPI to work. The pins below are the four control lines on top
 // of that.
-constexpr int ESP32_CS_PIN     = 40;  // any GPIO works for CS; PinDefinitions still says 10
-                                      // — update there once main firmware uses WiFi.
-constexpr int ESP32_BUSY_PIN   = 39;
-constexpr int ESP32_RESETN_PIN = 38;
-constexpr int ESP32_GPIO0_PIN  = -1;  // not connected; AirLift's internal pull-up
-                                      // holds boot mode strap HIGH for normal run
+constexpr int ESP32_CS_PIN     = 10;  // matches PinDefinitions::ESP32_CS and board wiring
+constexpr int ESP32_BUSY_PIN   = 17;
+constexpr int ESP32_RESETN_PIN = 16;
+constexpr int ESP32_GPIO0_PIN  = 15;  // driven HIGH explicitly so ESP32 always
+                                      // boots NINA-FW instead of the UART
+                                      // download stub (used by esp32_passthrough)
 
 // ─── WiFi config ─────────────────────────────────────────────────────────────
 // AP mode: the rocket *is* the network. Anyone within ~30 m can see the SSID,
@@ -87,8 +87,90 @@ void setup() {
   Serial.print(F(" RESETN="));     Serial.print(ESP32_RESETN_PIN);
   Serial.print(F(" GPIO0="));      Serial.println(ESP32_GPIO0_PIN);
 
-  WiFi.setPins(ESP32_CS_PIN, ESP32_BUSY_PIN, ESP32_RESETN_PIN, ESP32_GPIO0_PIN);
+  // Manual ESP32 reset + BUSY-line probe BEFORE handing control to WiFiNINA.
+  // The library's internal reset is sometimes too fast on Teensy 4.1, leaving
+  // the ESP32 in an indeterminate state. We pulse RESETN ourselves and watch
+  // BUSY to see whether the ESP32 actually boots.
+  pinMode(ESP32_RESETN_PIN, OUTPUT);
+  pinMode(ESP32_BUSY_PIN,   INPUT);
+  pinMode(ESP32_CS_PIN,     OUTPUT);
+  pinMode(ESP32_GPIO0_PIN,  OUTPUT);
+  digitalWrite(ESP32_GPIO0_PIN, HIGH); // strap for normal NINA boot (not UART download)
+  digitalWrite(ESP32_CS_PIN, HIGH);    // deassert CS
+  Serial.print(F("BUSY before reset: "));
+  Serial.println(digitalRead(ESP32_BUSY_PIN));
+  digitalWrite(ESP32_RESETN_PIN, LOW);
+  // Read BUSY multiple times during the 100ms hold. If ESP32 is the sole
+  // driver of BUSY, it should go LOW (or float) while held in reset.
+  Serial.print(F("BUSY during RESETN=LOW (500ms): "));
+  for (int i = 0; i < 10; i++) { Serial.print(digitalRead(ESP32_BUSY_PIN)); delay(50); }
+  Serial.println();
+  digitalWrite(ESP32_RESETN_PIN, HIGH);
+  Serial.println(F("RESETN released, polling BUSY for 10s:"));
+  uint32_t t_reset = millis();
+  int last = -1;
+  while (millis() - t_reset < 10000) {
+    int b = digitalRead(ESP32_BUSY_PIN);
+    if (b != last) {
+      Serial.print(F("  t=")); Serial.print(millis() - t_reset);
+      Serial.print(F("ms BUSY=")); Serial.println(b);
+      last = b;
+    }
+    delay(5);
+  }
+  Serial.print(F("BUSY final: "));
+  Serial.println(digitalRead(ESP32_BUSY_PIN));
+
+  // ── Raw SPI probe (bypasses WiFiNINA) ──────────────────────────────────────
+  // Try every SPI mode × multiple clock speeds. Send the NINA START byte
+  // (0xE0 = CMD_FLAG) and read 16 bytes. A live NINA slave must pull MISO low
+  // at some point (ACK byte, padding, etc.) — dead silence across every
+  // combination = chip isn't running NINA-FW. Also watch BUSY around each
+  // transaction to see if CS assert triggers any reaction.
   SPI.begin();
+  const uint32_t clocks[] = {8000000, 4000000, 1000000, 200000};
+  const uint8_t  modes[]  = {SPI_MODE0, SPI_MODE1, SPI_MODE2, SPI_MODE3};
+  bool any_life = false;
+  for (uint8_t m = 0; m < 4; m++) {
+    for (uint8_t c = 0; c < 4; c++) {
+      SPI.beginTransaction(SPISettings(clocks[c], MSBFIRST, modes[m]));
+      int b_pre = digitalRead(ESP32_BUSY_PIN);
+      digitalWrite(ESP32_CS_PIN, LOW);
+      delayMicroseconds(200);
+      int b_cs_low = digitalRead(ESP32_BUSY_PIN);
+      uint8_t rx[16];
+      rx[0] = SPI.transfer(0xE0);  // CMD_START
+      for (int i = 1; i < 16; i++) rx[i] = SPI.transfer(0xFF);
+      int b_after = digitalRead(ESP32_BUSY_PIN);
+      digitalWrite(ESP32_CS_PIN, HIGH);
+      SPI.endTransaction();
+      bool all_zero = true, all_ff = true;
+      for (int i = 0; i < 16; i++) {
+        if (rx[i] != 0x00) all_zero = false;
+        if (rx[i] != 0xFF) all_ff = false;
+      }
+      Serial.print(F("  MODE")); Serial.print(modes[m]);
+      Serial.print(F(" @")); Serial.print(clocks[c]);
+      Serial.print(F(" BUSY[pre/csL/post]=")); Serial.print(b_pre);
+      Serial.print('/'); Serial.print(b_cs_low);
+      Serial.print('/'); Serial.print(b_after);
+      Serial.print(F("  MISO:"));
+      for (int i = 0; i < 16; i++) {
+        Serial.print(' ');
+        if (rx[i] < 0x10) Serial.print('0');
+        Serial.print(rx[i], HEX);
+      }
+      if (all_zero)      Serial.println(F("  [stuck-LOW]"));
+      else if (all_ff)   Serial.println(F("  [stuck-HIGH]"));
+      else { Serial.println(F("  ← LIFE")); any_life = true; }
+      delay(20);
+    }
+  }
+  Serial.print(F("Probe summary: "));
+  Serial.println(any_life ? F("ESP32 SPI slave responded in at least one config.")
+                          : F("No response in any SPI mode/speed — chip is not running NINA-FW."));
+
+  WiFi.setPins(ESP32_CS_PIN, ESP32_BUSY_PIN, ESP32_RESETN_PIN, ESP32_GPIO0_PIN);
 
   if (WiFi.status() == WL_NO_MODULE) {
     Serial.println(F("FAIL: AirLift not detected."));

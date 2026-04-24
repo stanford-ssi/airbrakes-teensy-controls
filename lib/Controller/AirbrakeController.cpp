@@ -25,11 +25,21 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
         apogee_time_ = time_s;
     }
 
+    // Helper: run a single forward coast sim using the brakes' *current*
+    // commanded Cd. Keeps predicted_apogee_ live during retracted phases so
+    // the dashboard shows the same no-brakes/live prediction the Python demo
+    // does, instead of falling back to current altitude.
+    auto displayApogee = [&]() -> float {
+        if (vel <= 0.0f) return alt_agl;
+        return predictor_.simulateCoast(alt_agl, vel, cd_add_cmd_,
+                                         RocketConfig::LAUNCH_SITE_ALT_MSL_M);
+    };
+
     // Motor still burning, keep brakes retracted
     if (flight_state <= 4) { // BOOT..IGNITION
         state_ = CTRL_RETRACTED;
         cd_add_cmd_ = 0.0f;
-        predicted_apogee_ = 0.0f;
+        predicted_apogee_ = displayApogee();
         return cd_add_cmd_;
     }
 
@@ -38,6 +48,7 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
         (time_s - launch_time_) < RocketConfig::POST_LAUNCH_DELAY_S) {
         state_ = CTRL_RETRACTED;
         cd_add_cmd_ = 0.0f;
+        predicted_apogee_ = displayApogee();
         return cd_add_cmd_;
     }
 
@@ -46,6 +57,7 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
         (time_s - apogee_time_) > RocketConfig::POST_APOGEE_RETRACT_DELAY_S) {
         state_ = CTRL_RETRACTED;
         cd_add_cmd_ = 0.0f;
+        predicted_apogee_ = displayApogee();
         return cd_add_cmd_;
     }
 
@@ -53,6 +65,7 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
     if (mach > RocketConfig::MACH_SUPERSONIC) {
         state_ = CTRL_RETRACTED;
         cd_add_cmd_ = 0.0f;
+        predicted_apogee_ = displayApogee();
         return cd_add_cmd_;
     }
 
@@ -77,6 +90,9 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
 
         predicted_apogee_ = result.predicted_apogee;
         target_cd = result.cd_add;
+        last_target_cd_raw_ = result.cd_add;
+        last_apo_no_ = result.apo_no_brakes;
+        last_apo_max_ = result.apo_max_brakes;
         state_ = CTRL_ACTIVE;
     }
 

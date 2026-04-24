@@ -74,7 +74,11 @@ bool Logging::begin() {
 }
 
 void Logging::log(const char *message, bool newline) {
-  if (debug) {
+  // Only talk to USB CDC if a host is actually connected. Without this guard,
+  // an unplugged cable mid-flight leaves the TX buffer slowly filling up and
+  // eventually blocks the main loop — which kills flight control. SD logging
+  // keeps running regardless so every tick still makes it to the launch log.
+  if (debug && Serial) {
     if (newline)
       Serial.println(message);
     else
@@ -122,6 +126,11 @@ void Logging::logTelemetry(float altitude, float velocity, const SensorData_t &s
   buf.field(i2c.failCount);
   buf.field((int)sens.potentiometer_value);
   buf.field(velocity);
+  // Predictor diagnostics (target cd_add before slew, no-brake apo, max-brake apo)
+  // so the dashboard can cross-check the Teensy predictor against the Python port.
+  buf.field(i2c.target_cd_raw, 4);
+  buf.field(i2c.apo_no_brakes, 1);
+  buf.field(i2c.apo_max_brakes, 1);
   log(buf.str());
 
   if (millis() - lastFlush > 1000) {

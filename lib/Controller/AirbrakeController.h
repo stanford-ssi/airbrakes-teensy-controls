@@ -29,6 +29,14 @@ public:
     float predictedApogee() const { return predicted_apogee_; }
     State controllerState() const { return state_; }
 
+    // Diagnostics — set by the last predict() call. Zero when the controller
+    // isn't actively predicting (retract / descent / above-target branches).
+    // Logged on every telemetry frame so the dashboard can compare against the
+    // Python-side predictor and catch Teensy↔Python parity regressions.
+    float lastTargetCdRaw() const { return last_target_cd_raw_; }
+    float lastApoNoBrakes() const { return last_apo_no_; }
+    float lastApoMaxBrakes() const { return last_apo_max_; }
+
     // Clear internal state so a new SHITL run starts cleanly without a
     // firmware reflash — otherwise launch_detected_ / apogee_detected_
     // carry over from a previous session and suppress the controller.
@@ -40,6 +48,9 @@ public:
         apogee_detected_ = false;
         launch_time_ = 0.0f;
         launch_detected_ = false;
+        last_target_cd_raw_ = 0.0f;
+        last_apo_no_ = 0.0f;
+        last_apo_max_ = 0.0f;
     }
 
 private:
@@ -51,4 +62,8 @@ private:
     bool apogee_detected_;
     float launch_time_;         // Time when ignition first detected (s)
     bool launch_detected_;
+    // Predictor diagnostics (last active-control tick).
+    float last_target_cd_raw_ = 0.0f;
+    float last_apo_no_ = 0.0f;
+    float last_apo_max_ = 0.0f;
 };

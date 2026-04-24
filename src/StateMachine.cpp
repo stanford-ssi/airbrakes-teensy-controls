@@ -11,7 +11,7 @@ static States handleSensorError() {
 static States handleIdle() {
   statusIndicator.solid(StatusIndicator::GREEN);
 
-  if (sensors.accel_y > IGNITION_ACCEL_THRESHOLD) {
+  if (sensors.accel_z > IGNITION_ACCEL_THRESHOLD) {
     FlightState.ignition_time = millis();
     FlightState.velocity = 0.0f;
     primaryIgniter.arm();
@@ -19,6 +19,9 @@ static States handleIdle() {
   }
 
   if (!BrakeState.hasCheckedForHorizontal) {
+    // Z is the thrust axis, so the rocket is vertical when |Z| dominates.
+    // If X or Y dominates instead, it's lying on its side — do an airbrake
+    // sweep as a ground test instead of arming ignition detection.
     if (abs(sensors.accel_x) > abs(sensors.accel_z) ||
         abs(sensors.accel_y) > abs(sensors.accel_z)) {
       BrakeState.direction = 1;
@@ -57,7 +60,9 @@ static States handleAirbrakeTest() {
 static States handleIgnition() {
   statusIndicator.solid(StatusIndicator::ORANGE);
 
-  if (sensors.accel_y < 0) {
+  // Z is the thrust axis. Burnout = net accel crosses negative (drag+gravity
+  // decelerating the rocket instead of thrust accelerating it).
+  if (sensors.accel_z < 0) {
     FlightState.motor_burnout_time = millis();
     return States::ASCENT;
   }
