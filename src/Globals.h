@@ -23,12 +23,17 @@ struct SensorData_t {
 // Brake actuator state (commanded position + sweep bookkeeping).
 //   pct: airbrake-% [0..100], 0 = retracted. driveServos() also updates this.
 //   direction / last_update: AIRBRAKE_TEST and fallback-sweep step state.
+//   fallback_sweep_count: completed 0→max→0 cycles in runFallbackSweep().
+//     Capped at FALLBACK_SWEEP_COUNT — beyond that we hold retracted rather
+//     than sweeping forever, since the same I2C failure that kicked us into
+//     fallback could be a brake-actuator fault we don't want to keep poking.
 //   hasCheckedForHorizontal: latched after the first IDLE tick to avoid
 //     re-running the orientation check after the rocket leaves the pad.
 struct BrakeState_t {
   float pct = 0.0f;
   int direction = 1;
   unsigned long last_update = 0;
+  int fallback_sweep_count = 0;
   bool hasCheckedForHorizontal = false;
 };
 

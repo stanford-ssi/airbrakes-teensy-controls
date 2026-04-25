@@ -9,6 +9,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <StateMachine.h>
+#include <WifiPins.h>
 #include <Wire.h>
 #include <control/ControlStruct.h>
 #include <sensor_drivers/Adxl.h>
@@ -41,9 +42,13 @@ static inline bool isSimMode(TeensyMode m) {
   return m == TeensyMode::SHITL || m == TeensyMode::SHITL_DEMO;
 }
 
-// Block real-pyro outputs in SHITL/SHITL_DEMO so simulated ignition
-// profiles can't drive IGNITER_0 HIGH on the bench.
-bool shouldInhibitPyros() { return isSimMode(currentMode); }
+// Block real-pyro outputs in SHITL/SHITL_DEMO so simulated ignition profiles
+// can't drive IGNITER_0 HIGH on the bench, AND on flights where no apogee
+// charge is physically installed (PYROS_INSTALLED=false in Config.h).
+// shouldInhibitPyros() == true means handleIdle skips primaryIgniter.arm(),
+// so even if the operator ARMs and APOGEE fires, Igniter::fire() finds
+// armed=false and never calls digitalWrite(igniterPin, HIGH).
+bool shouldInhibitPyros() { return !PYROS_INSTALLED || isSimMode(currentMode); }
 
 // Read-only accessor for the sticky arm flag (StateMachine gates the pyro on it).
 bool isArmed() { return armed; }
@@ -683,8 +688,18 @@ static void handleSerialCommand(const char *line) {
   } else if (strncmp(line, "READ,SD,", 8) == 0) {
     // Streams the named file as SD_LINE,<content> rows wrapped in
     // SD_FILE_BEGIN/END. Flush the live log first so a download of the
-    // current LOG###.TXT sees pending writes. Calling comm.poll() inside
-    // the loop keeps the WiFi AP alive during long downloads.
+    // current LOG###.TXT sees pending writes.
+    //
+    // Per-line shape is built in one buffer ("SD_LINE,<content>") and
+    // emitted with a single comm.println — that becomes one TCP write
+    // (body + CRLF combined). Previously the prefix and body were two
+    // separate writes, which on long downloads filled NINA-FW's TCP send
+    // buffer faster than the dashboard could drain it; the second write
+    // would return 0 and (until _tcpWriteAll's retry was added) silently
+    // drop the chunk, halting the download partway through.
+    //
+    // We also bail out of the read loop early if the link drops, instead
+    // of churning the SD card just to throw bytes at a closed socket.
     const char* fname = line + 8;
     logging.flush();
     File f = SD.open(fname, FILE_READ);
@@ -698,13 +713,21 @@ static void handleSerialCommand(const char *line) {
       comm.print(",");
       comm.print(size);
       comm.println();
-      char linebuf[280];
-      while (f.available()) {
-        size_t n = f.readBytesUntil('\n', linebuf, sizeof(linebuf) - 1);
-        while (n > 0 && (linebuf[n-1] == '\r' || linebuf[n-1] == '\n')) n--;
-        linebuf[n] = '\0';
-        comm.print(F("SD_LINE,"));
-        comm.println(linebuf);
+
+      char outbuf[300];
+      static const char prefix[] = "SD_LINE,";
+      constexpr size_t prefix_len = sizeof(prefix) - 1;  // 8
+      memcpy(outbuf, prefix, prefix_len);
+      while (f.available() && comm.connected()) {
+        size_t n = f.readBytesUntil('\n', outbuf + prefix_len,
+                                    sizeof(outbuf) - prefix_len - 1);
+        while (n > 0 && (outbuf[prefix_len + n - 1] == '\r' ||
+                         outbuf[prefix_len + n - 1] == '\n')) n--;
+        outbuf[prefix_len + n] = '\0';
+        comm.println(outbuf);
+        // Pump WiFi accept / STATUS so the AP doesn't appear dead on a
+        // multi-second download. _tcpWriteAll already yields per partial
+        // write, so no extra delay here.
         comm.poll();
       }
       f.close();
@@ -877,10 +900,14 @@ static float readSimulatedSensors() {
   return altitudeDelta(sensors.pressure, sensors.temperature + CELSIUS_TO_KELVIN);
 }
 
-// Updates max_velocity and max_accel_g every loop so a dashboard reconnecting
-// after landing sees the peak values immediately. max_altitude is maintained
-// by the state machine (handleAscent) and the SHITL ground-truth path.
-static void updateFlightMaxima() {
+// Updates max_altitude / max_velocity / max_accel_g every loop so a dashboard
+// reconnecting after landing sees the peak values immediately, AND so that
+// max_altitude starts climbing as soon as the firmware leaves the pad-pinned
+// 0-altitude regime (i.e. the moment IGNITION fires) instead of waiting for
+// ASCENT. While on the pad, callers pass altitude=0 so the max stays at 0
+// regardless of baro noise.
+static void updateFlightMaxima(float altitude) {
+  if (altitude > FlightState.max_altitude) FlightState.max_altitude = altitude;
   float v = fabsf(FlightState.velocity);
   if (v > FlightState.max_velocity) FlightState.max_velocity = v;
   float az = fmaxf(fabsf(sensors.accel_z), fabsf(sensors.accel_z_high_g));
@@ -979,7 +1006,12 @@ static void runLocalController(float altitude) {
 // Open-loop airbrake sweep for the case where the control Teensy is
 // unreachable. Holds off until well past burnout, then steps the brakes
 // AIRBRAKE_MIN ↔ AIRBRAKE_MAX on a fixed cadence. NOT apogee-targeted.
+// Bails out after FALLBACK_SWEEP_COUNT full cycles so we don't keep poking
+// a possibly-faulty actuator all the way to apogee — by then the brakes
+// are parked at AIRBRAKE_MIN (we increment when arriving there).
 static void runFallbackSweep() {
+  if (BrakeState.fallback_sweep_count >= FALLBACK_SWEEP_COUNT) return;
+
   if (millis() - FlightState.ignition_time < FALLBACK_IGNITION_DELAY_MS &&
       millis() - FlightState.motor_burnout_time < FALLBACK_BURNOUT_DELAY_MS) {
     return;
@@ -996,6 +1028,7 @@ static void runFallbackSweep() {
   } else if (airbrake_pct <= AIRBRAKE_MIN) {
     airbrake_pct = AIRBRAKE_MIN;
     BrakeState.direction = 1;
+    BrakeState.fallback_sweep_count++;
   }
   driveServos(RocketConfig::airbrakePctToServoPct(airbrake_pct));
 }
@@ -1009,13 +1042,33 @@ static bool isOnPad() {
 }
 
 // FLIGHT loop: real sensors → state machine → during ASCENT, send sensor
-// frame to control Teensy and apply the returned servo command, falling back
-// to open-loop sweep on I2C failure.
+// frame to the control Teensy and apply the returned servo command. If I2C
+// to the control Teensy is down (bench testing without the second board, or
+// the control Teensy fails mid-flight), run the same AirbrakeController
+// locally — same code path SHITL exercises every day — so we still get
+// apogee-targeted guidance instead of a dumb open-loop sweep.
+//
+// Why not the old runFallbackSweep(): it's a fixed-cadence MIN↔MAX pattern
+// that ignores velocity, altitude, and predicted apogee, so on a bench
+// flight (or any flight where I2C drops within 500 ms of liftoff) the
+// rocket has no real guidance through coast. The local controller path
+// has the full predictor + Cd→servo pipeline and runs on every input the
+// airbrakes Teensy already has (baro, accel, velocity, atmosphere, state).
+// runFallbackSweep is kept compiled but no longer reachable from FLIGHT —
+// retain it for now in case we ever want to wire it back in as a deeper
+// "controller-also-broken" fallback.
 static void loopFlight() {
   float raw_alt = readRealSensors();
   if (isnan(raw_alt)) return;
 
-  float altitude = isOnPad() ? 0.0f : filterAltitude(raw_alt);
+  // Always run the filter so kinematic_vel (and the UKF) stay live during
+  // IDLE — the dashboard wants to show what the firmware thinks the current
+  // velocity is even on the pad. After ZERO calibration on a stationary
+  // rocket, kinematic_vel reads ~0 m/s; pick it up and the integrated accel
+  // shows real motion. Display altitude is still pinned to 0 on the pad so
+  // the chart doesn't render baro noise as motion.
+  float filtered_alt = filterAltitude(raw_alt);
+  float altitude = isOnPad() ? 0.0f : filtered_alt;
 
   checkSerialCommands();
   updateStateMachine(altitude);
@@ -1025,11 +1078,13 @@ static void loopFlight() {
       sendControlPacket(altitude);
       driveServos(I2CControl.cmd_servo_1);
     } else {
-      runFallbackSweep();
+      // Same controller SHITL runs. Bench flights without the control
+      // Teensy now exercise the real guidance instead of the sweep.
+      runLocalController(altitude);
     }
   }
 
-  updateFlightMaxima();
+  updateFlightMaxima(altitude);
   logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
@@ -1048,7 +1103,7 @@ static void loopSHITL() {
     state = phaseCodeToState(SimTruth.phase_code);
     altitude = SimTruth.alt_m;
     FlightState.velocity = SimTruth.vel_ms;
-    FlightState.max_altitude = fmaxf(FlightState.max_altitude, altitude);
+    // updateFlightMaxima below picks this up — no need to track here too.
   } else {
     // Run UKF + state machine every tick — including pre-launch — so velocity
     // is already tracking the burn by the time the predictor needs it.
@@ -1058,7 +1113,7 @@ static void loopSHITL() {
 
   runLocalController(altitude);
 
-  updateFlightMaxima();
+  updateFlightMaxima(altitude);
   logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
@@ -1074,7 +1129,7 @@ static void loopTest() {
   float altitude = filterAltitude(raw_alt);
 
   checkSerialCommands();
-  updateFlightMaxima();
+  updateFlightMaxima(altitude);
   logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
@@ -1090,7 +1145,7 @@ static void loopSensorMoving() {
   float altitude = filterAltitude(raw_alt);
 
   checkSerialCommands();
-  updateFlightMaxima();
+  updateFlightMaxima(altitude);
   logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
@@ -1126,8 +1181,10 @@ void setup() {
 
   // AirLift comes up BEFORE mode negotiation so a WiFi dashboard can
   // participate in the READY/MODE handshake. Three short beeps confirm
-  // the AP is listening; absence of beeps = USB-only mode.
-  if (comm.beginWiFi("AirbrakesRocket", "irec202630k", 4040)) {
+  // the AP is listening; absence of beeps = USB-only mode. SSID/PASS/PORT
+  // are defined in WifiPins.h alongside the AirLift control pin map so
+  // CommLink and the wifi_bringup smoke test stay in lockstep.
+  if (comm.beginWiFi(WifiAP::SSID, WifiAP::PASS, WifiAP::PORT)) {
     wifiBootBuzzerConfirm();
   }
 
@@ -1143,7 +1200,10 @@ void setup() {
   Wire.begin();
   Wire.setClock(100000);
 
-  delay(4000);  // sensor power-up settle
+  // pollDelay() instead of delay() so the AirLift TCP backlog drains during
+  // long setup waits — without it, a dashboard that opens TCP while we're
+  // still in setup sits unbound until loop() starts (which can be 15+ s).
+  comm.pollDelay(4000);  // sensor power-up settle
 
   // Retry SD for ~10 s so a slow card insertion doesn't strand the Teensy.
   // After that, continue without a log rather than locking on RED.
@@ -1153,7 +1213,7 @@ void setup() {
     if (!sd_ok) {
       statusIndicator.solid(StatusIndicator::RED);
       Serial.println(F("Waiting for SD card..."));
-      delay(1000);
+      comm.pollDelay(1000);
     }
   }
   if (sd_ok) {

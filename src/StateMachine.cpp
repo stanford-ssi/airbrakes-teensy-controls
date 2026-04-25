@@ -116,7 +116,10 @@ static const int APOGEE_CONFIRM_THRESHOLD = 5;
 static States handleAscent(float altitude) {
   statusIndicator.solid(StatusIndicator::RED);
 
-  FlightState.max_altitude = max(FlightState.max_altitude, altitude);
+  // max_altitude is now tracked centrally in updateFlightMaxima (called
+  // every tick by the loop functions), so it climbs from the moment
+  // altitude leaves the pad-pinned 0 regime — i.e. as soon as IGNITION
+  // fires, not only once we reach ASCENT.
 
   bool machLockout = FlightState.velocity > MACH_LOCKOUT_VELOCITY;
   bool altDecreasing = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);

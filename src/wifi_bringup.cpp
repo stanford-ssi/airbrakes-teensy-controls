@@ -37,25 +37,21 @@
 #include <SPI.h>
 #include <WiFiNINA.h>
 
-// ─── Pin assignments ─────────────────────────────────────────────────────────
-// SPI lines (MOSI=11, MISO=12, SCK=13) are implicit — they're whatever the
-// default `SPI` peripheral uses on Teensy 4.1 (LPSPI4 on the top edge). The
-// AirLift breakout's MOSI/MISO/SCK pads must be wired to those Teensy pins
-// for hardware SPI to work. The pins below are the four control lines on top
-// of that.
-constexpr int ESP32_CS_PIN     = 10;  // matches PinDefinitions::ESP32_CS and board wiring
-constexpr int ESP32_BUSY_PIN   = 17;
-constexpr int ESP32_RESETN_PIN = 16;
-constexpr int ESP32_GPIO0_PIN  = 15;  // driven HIGH explicitly so ESP32 always
-                                      // boots NINA-FW instead of the UART
-                                      // download stub (used by esp32_passthrough)
+#include "WifiPins.h"
 
-// ─── WiFi config ─────────────────────────────────────────────────────────────
-// AP mode: the rocket *is* the network. Anyone within ~30 m can see the SSID,
-// so keep WPA2 enabled (8+ char password). Change these to whatever you like.
-const char* AP_SSID = "AirbrakesRocket";
-const char* AP_PASS = "irec202630k";  // WPA2 minimum 8 chars
-constexpr uint16_t TCP_PORT = 4040;
+// ─── Pin / WiFi config ───────────────────────────────────────────────────────
+// All four AirLift control pins and the AP credentials live in WifiPins.h so
+// this sketch and CommLink stay in lockstep. SPI lines (MOSI=11, MISO=12,
+// SCK=13) are implicit — they're the default Teensy 4.1 SPI peripheral
+// (LPSPI4 on the top edge); the AirLift breakout's MOSI/MISO/SCK pads must
+// be wired to those Teensy pins for hardware SPI to work.
+constexpr int ESP32_CS_PIN     = WifiPins::CS;
+constexpr int ESP32_BUSY_PIN   = WifiPins::BUSY;
+constexpr int ESP32_RESETN_PIN = WifiPins::RESETN;
+constexpr int ESP32_GPIO0_PIN  = WifiPins::GPIO0;
+const char* AP_SSID            = WifiAP::SSID;
+const char* AP_PASS            = WifiAP::PASS;
+constexpr uint16_t TCP_PORT    = WifiAP::PORT;
 
 WiFiServer server(TCP_PORT);
 WiFiClient client;
