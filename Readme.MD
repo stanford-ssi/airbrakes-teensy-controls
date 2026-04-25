@@ -32,6 +32,8 @@ cd ~/Documents/airbrakes-teensy-controls
 pio run -e teensy41 -t upload
 ```
 
+/Users/noahweiss/.platformio/penv/bin/pio run -e teensy41 -t upload
+
 That compiles + flashes in one shot. If upload hangs or errors out with "no Teensy found":
 1. Physically press the small program button on the Teensy.
 2. Re-run the upload command above.

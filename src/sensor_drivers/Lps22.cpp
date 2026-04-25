@@ -13,7 +13,10 @@ bool Lps22::begin() {
     return false;
   }
 
-  writeRegister(0x10, 0x50);  // CTRL_REG1: 75Hz ODR, no low-pass filter, no BDU
+  // CTRL_REG1 = 0x5A: 75 Hz ODR, on-chip LPF (≈8.3 Hz cutoff), Block Data
+  // Update on. BDU latches pressure + temperature coherently across the
+  // multi-byte burst read so we never splice halves of two samples.
+  writeRegister(0x10, 0x5A);
   return true;
 }
 

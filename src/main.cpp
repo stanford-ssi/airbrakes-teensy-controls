@@ -1,6 +1,7 @@
 #define DEBUG_MODE 1  // Set to 0 for flight, 1 for bench testing
 
 #include <Arduino.h>
+#include <CommLink.h>
 #include <Globals.h>
 #include <Logging.h>
 #include <PhysicsConstants.h>
@@ -24,25 +25,32 @@
 #define USE_TELEMETRY 0
 
 // ── Operating Modes ──────────────────────────────────────────────
-// FLIGHT:        Real sensors, full state machine, actual launch
-// SHITL:         Simulated sensors from serial, local controller, servos active
-// SHITL_DEMO:    Same as SHITL but physical servos are NOT driven (demo/bench)
-// TEST:          Real sensors, servo testing, no state machine
-// SENSOR_MOVING: Real sensors, UKF runs, no state machine, no servo motion.
-//                Logs CSV to SD in the same format as FLIGHT so ground tests
-//                (carrying/rotating/shaking the rocket) produce a file that
-//                parses with the same tooling.
+// FLIGHT:        Real sensors, full state machine, actual launch.
+// SHITL:         Simulated sensors over serial, local controller, servos active.
+// SHITL_DEMO:    SHITL with physical servos suppressed (bench demo).
+// TEST:          Real sensors, manual servo testing, no state machine.
+// SENSOR_MOVING: Real sensors + UKF + SD log, no state machine, no servo motion.
 enum class TeensyMode { FLIGHT, SHITL, SHITL_DEMO, TEST, SENSOR_MOVING };
 static TeensyMode currentMode = TeensyMode::FLIGHT;
+
+// Sticky arm flag: ARM → true, DISARM / mode switch / power cycle → false.
+// Never auto-cleared on WiFi loss (rocket leaves AP range mid-flight).
+static bool armed = false;
 
 static inline bool isSimMode(TeensyMode m) {
   return m == TeensyMode::SHITL || m == TeensyMode::SHITL_DEMO;
 }
 
-// driveServos: command the physical servos by extension % [SERVO_MIN_PCT..SERVO_MAX_PCT].
-// BrakeState.pct mirrors the same command in user-facing airbrake-% [0..100]
-// (0 at SERVO_MIN_PCT, 100 at SERVO_MAX_PCT) so the logged Airbrake_pct column
-// reads the way operators expect — 0 when retracted, not 20.
+// Block real-pyro outputs in SHITL/SHITL_DEMO so simulated ignition
+// profiles can't drive IGNITER_0 HIGH on the bench.
+bool shouldInhibitPyros() { return isSimMode(currentMode); }
+
+// Read-only accessor for the sticky arm flag (StateMachine gates the pyro on it).
+bool isArmed() { return armed; }
+
+// Drives both servos to the given extension % and mirrors it into BrakeState.pct
+// (in airbrake-%, 0 = retracted) for telemetry. Suppresses physical motion in
+// SHITL_DEMO.
 void driveServos(float pct) {
   pct = constrain(pct, RocketConfig::SERVO_MIN_PCT, RocketConfig::SERVO_MAX_PCT);
   BrakeState.pct = RocketConfig::servoPctToAirbrakePct(pct);
@@ -62,9 +70,11 @@ static const char* modeToString(TeensyMode m) {
   return "UNKNOWN";
 }
 
-// Audible confirmation the Teensy booted in FLIGHT mode. 5 on/off cycles of
-// 500 ms each = 5 s total, using tone() so it works with both passive and
-// active buzzers.
+// Boot tones. Three distinct cadences so the operator can tell by ear which
+// event just fired:
+//   FLIGHT mode entered:  5 × 500 ms @ 2000 Hz   (5 s total, slow)
+//   WiFi AP came up:      3 × 80 ms  @ 2500 Hz   (chirpy, higher pitch)
+//   USB unplugged:        8 × 250 ms @ 2000 Hz   (4 s total, tighter cadence)
 static void flightModeBuzzerConfirm() {
   const int BEEP_FREQ_HZ = 2000;
   const int BEEP_HALF_PERIOD_MS = 500;
@@ -78,10 +88,20 @@ static void flightModeBuzzerConfirm() {
   }
 }
 
-// Audible confirmation the USB cable was unplugged while in FLIGHT mode and
-// the Teensy is now running on internal battery power. 8 cycles × 250 ms on /
-// 250 ms off = 4 s total. The tighter cadence (vs the 5-beep flight-mode
-// confirm) makes it unambiguous by ear which event just fired.
+static void wifiBootBuzzerConfirm() {
+  const int BEEP_FREQ_HZ = 2500;
+  const int BEEP_ON_MS = 80;
+  const int BEEP_OFF_MS = 80;
+  const int BEEP_CYCLES = 3;
+  for (int i = 0; i < BEEP_CYCLES; i++) {
+    tone(PinDefs.BUZZER, BEEP_FREQ_HZ);
+    delay(BEEP_ON_MS);
+    noTone(PinDefs.BUZZER);
+    digitalWrite(PinDefs.BUZZER, LOW);
+    delay(BEEP_OFF_MS);
+  }
+}
+
 static void internalPowerBuzzerConfirm() {
   const int BEEP_FREQ_HZ = 2000;
   const int BEEP_HALF_PERIOD_MS = 250;
@@ -123,45 +143,54 @@ int failed_sensors = 0;
 
 unsigned long last_loop_time = 0;
 
+// At-rest reference captured by calibrateSensors(). Per-chip accel-Z bias is
+// required because ADXL345 and ADXL375 have independent zero offsets, and the
+// IGNITION-phase weighting puts most weight on the high-g chip — a shared
+// bias would integrate into kinematic_vel during burn.
 static struct {
   float pressure = 0;
   float temperature = 0;
-  // Accel-Z reading at rest (gravity on the thrust axis). Defaults to ideal 1g;
-  // ZERO re-measures it so residual sensor bias doesn't integrate into phantom
-  // velocity drift.
-  float accel_z_bias = 1.0f;
+  float accel_z_bias = 0.0f;
+  float accel_z_high_g_bias = 0.0f;
 } RefCalibration;
 
 // ── Sensor Helpers ───────────────────────────────────────────────
 
-// Samples real sensors over ~1 second to capture the at-rest baseline.
-// Pressure/temperature become the altitude reference; accel-Z bias subtracts
-// the resting-gravity reading on the thrust axis so the filter doesn't drift
-// when the rocket is actually stationary.
-static void calibrateSensors(Lps22 &lps, Adxl *lg_accel = nullptr) {
+// Samples LPS22 + ADXL chips over ~1 s and stores the at-rest baseline in
+// RefCalibration. Pressure/temperature anchor the AGL altitude; per-chip Z bias
+// removes the resting-gravity + offset so accel integrates to zero at rest.
+// Returns false if no valid baro sample landed — setup() flags failed_sensors
+// in that case so we never fly on a zero-defaulted bias.
+static bool calibrateSensors(Lps22 &lps, Adxl *lg_accel = nullptr,
+                             Adxl *hg_accel = nullptr) {
   delay(100);
   const int N = 40;  // 40 samples × 25 ms = 1 s
   int valid = 0;
-  float p_sum = 0.0f, t_sum = 0.0f, a_sum = 0.0f;
+  float p_sum = 0.0f, t_sum = 0.0f;
+  float a_low_sum = 0.0f, a_high_sum = 0.0f;
   for (int i = 0; i < N; i++) {
     float p = 0.0f, t = 0.0f;
     lps.readPressure(&p);
     lps.readTemperature(&t);
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    float ax_hg = 0.0f, ay_hg = 0.0f, az_hg = 0.0f;
     if (lg_accel) lg_accel->readAccelerometer(&ax, &ay, &az);
+    if (hg_accel) hg_accel->readAccelerometer(&ax_hg, &ay_hg, &az_hg);
     if (p > 0.0f) {
       p_sum += p;
       t_sum += t;
-      a_sum += az;
+      a_low_sum += az;
+      a_high_sum += az_hg;
       valid++;
     }
     delay(25);
   }
-  if (valid > 0) {
-    RefCalibration.pressure = p_sum / (float)valid;
-    RefCalibration.temperature = t_sum / (float)valid + CELSIUS_TO_KELVIN;
-    if (lg_accel) RefCalibration.accel_z_bias = a_sum / (float)valid;
-  }
+  if (valid <= 0) return false;
+  RefCalibration.pressure = p_sum / (float)valid;
+  RefCalibration.temperature = t_sum / (float)valid + CELSIUS_TO_KELVIN;
+  if (lg_accel) RefCalibration.accel_z_bias = a_low_sum / (float)valid;
+  if (hg_accel) RefCalibration.accel_z_high_g_bias = a_high_sum / (float)valid;
+  return true;
 }
 
 template <typename T>
@@ -183,60 +212,93 @@ static bool initSensor(T &sensor, const char *name, int maxAttempts = 10) {
   return true;
 }
 
-static float altitudeDelta(float p, float T) {
+// AGL altitude from pressure via the ISA troposphere inverse, referenced to
+// RefCalibration.pressure (the at-rest baseline captured at launch site).
+// Exact inside the constant-lapse-rate regime (0–11 km), matches the Python sim.
+static float altitudeDelta(float p, float /*T*/) {
   if (p <= 0.0f) return NAN;
-  float p_ref = RefCalibration.pressure;
-  float T_ref = RefCalibration.temperature;
-  float Tbar = 0.5f * (T_ref + T);
-  return (Rd * Tbar / g0) * log(p_ref / p);
+  float p_ref = RefCalibration.pressure;     // mbar at launch site
+  float T_ref = RefCalibration.temperature;  // K at launch site
+  // L*Rd/g ≈ 0.190263 (dimensionless). T_ref/L gives the scale constant
+  // 284.05/0.0065 ≈ 43700 m — the height of the troposphere if T_ref held.
+  const float L = 0.0065f;
+  const float exponent = L * Rd / g0;
+  return (T_ref / L) * (1.0f - powf(p / p_ref, exponent));
 }
 
 // ── Altitude Filter ─────────────────────────────────────────────
 
+// Open-loop velocity from integrating blended accel. Used during burn because
+// the UKF's constant-accel process model can't track the thrust ramp.
+static float kinematic_vel = 0.0f;
+
+// Runs the UKF + kinematic integrator on the latest sensor frame and returns
+// the filtered AGL altitude. Sets FlightState.velocity using the dual-source
+// rule: kinematic during burn (UKF lags the thrust ramp), UKF during coast
+// (baro updates bound the accel-bias drift). On every state transition the
+// UKF is reseeded with kinematic_vel so coast begins with burn velocity intact.
+// See memory/project_velocity_estimator for full rationale.
 static float filterAltitude(float raw_alt) {
+  static States last_state = States::BOOT;
   float dt = LOOP_INTERVAL_MS / 1000.0f;
 
+  // Proper accel → coordinate accel (m/s²) for the UKF's constant-accel model.
+  float a_low  = (sensors.accel_z        - RefCalibration.accel_z_bias)        * g0;
+  float a_high = (sensors.accel_z_high_g - RefCalibration.accel_z_high_g_bias) * g0;
+
+  // First call after construction or after a UKF reset (enterSHITL / ZERO).
   if (!altitudeFilter.isInitialized()) {
-    altitudeFilter.init(raw_alt, 0.0f, 0.0f);
+    altitudeFilter.init(raw_alt, 0.0f, a_low);
     FlightState.velocity = 0.0f;
+    kinematic_vel = 0.0f;
+    last_state = state;
     return raw_alt;
   }
 
-  altitudeFilter.predict(dt);
-
-  // Weight from the filter's own velocity — avoids circular dependency through
-  // FlightState.velocity (which is itself derived from the filter).
+  // Inverse-variance blend of the two accel chips — same value the UKF
+  // updateAccel() will consume. Weights use kinematic_vel (not
+  // FlightState.velocity) to avoid feeding the filter's own output back in.
   SensorWeights w = SensorWeighting::getWeights(
-      static_cast<uint8_t>(state), altitudeFilter.velocity(), 343.0f);
-
-  // Blend both accelerometer channels via inverse-variance weighting and do a
-  // single UKF update — mathematically equivalent to two sequential updates
-  // (no predict between them) but half the compute cost. Subtract the measured
-  // at-rest bias (from ZERO calibration) instead of an ideal 1g, so residual
-  // sensor bias doesn't accumulate into phantom velocity drift.
-  float bias = RefCalibration.accel_z_bias;
-  float a_low  = (sensors.accel_z         - bias) * g0;
-  float a_high = (sensors.accel_z_high_g  - bias) * g0;
+      static_cast<uint8_t>(state), kinematic_vel, 343.0f);
   float inv_R_low  = 1.0f / w.R_accel_low;
   float inv_R_high = 1.0f / w.R_accel_high;
   float inv_R_sum  = inv_R_low + inv_R_high;
   float accel_blended = (a_low * inv_R_low + a_high * inv_R_high) / inv_R_sum;
   float R_blended     = 1.0f / inv_R_sum;
-  altitudeFilter.updateAccel(accel_blended, R_blended);
 
+  // Integrate every tick — skipping a tick at the IGNITION transition loses
+  // ~7 m/s of burn velocity.
+  kinematic_vel += accel_blended * dt;
+
+  // State change → reseed UKF with kinematic velocity so the next regime
+  // doesn't inherit a stale steady-state Kalman gain.
+  if (state != last_state) {
+    altitudeFilter.init(raw_alt, kinematic_vel, a_low);
+    FlightState.velocity = kinematic_vel;
+    last_state = state;
+    return raw_alt;
+  }
+
+  altitudeFilter.predict(dt);
+  altitudeFilter.updateAccel(accel_blended, R_blended);
   altitudeFilter.updateBaro(raw_alt, w.R_baro);
 
-  FlightState.velocity = altitudeFilter.velocity();
+  // Velocity source: UKF only during coast; kinematic everywhere else.
+  if (state == States::ASCENT) {
+    FlightState.velocity = altitudeFilter.velocity();
+  } else {
+    FlightState.velocity = kinematic_vel;
+  }
 
   return altitudeFilter.altitude();
 }
 
 // ── Mode Negotiation ─────────────────────────────────────────────
-// Protocol: Teensy sends READY, dashboard responds with MODE,<mode>
-// Fallback: Teensy sends DATAREQUEST, legacy scripts respond with CSV
+// New-style protocol: Teensy sends READY → dashboard responds MODE,<name>.
+// Legacy fallback:    Teensy sends DATAREQUEST → old SHITL scripts answer CSV.
 
-// Exact-match MODE,<name> against the line (no null-terminator fuzz, no
-// prefix-order gotchas — SHITL vs SHITL_DEMO is unambiguous).
+// Exact-match MODE,<name> parser. Avoids prefix-match ambiguity between
+// MODE,SHITL and MODE,SHITL_DEMO.
 static bool parseMode(const char *line, TeensyMode *out) {
   if (strcmp(line, "MODE,FLIGHT")        == 0) { *out = TeensyMode::FLIGHT;        return true; }
   if (strcmp(line, "MODE,SHITL")         == 0) { *out = TeensyMode::SHITL;         return true; }
@@ -247,19 +309,19 @@ static bool parseMode(const char *line, TeensyMode *out) {
 }
 
 static void ackMode(TeensyMode m) {
-  Serial.print("MODE_ACK,");
-  Serial.println(modeToString(m));
+  comm.print("MODE_ACK,");
+  comm.println(modeToString(m));
 }
 
 static TeensyMode negotiateMode() {
-  while (Serial.available()) Serial.read();  // flush stale data
+  while (comm.available()) comm.read();  // flush stale data
 
   // Phase 1: New protocol — send READY, wait for MODE command
-  Serial.println("READY");
-  Serial.setTimeout(2000);
+  comm.println("READY");
+  comm.setTimeout(2000);
 
   char buf[128];
-  int len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+  int len = comm.readBytesUntil('\n', buf, sizeof(buf) - 1);
   buf[len] = '\0';
 
   if (len > 0) {
@@ -273,11 +335,11 @@ static TeensyMode negotiateMode() {
   }
 
   // Phase 2: Legacy — send DATAREQUEST, check for CSV response
-  while (Serial.available()) Serial.read();
-  Serial.println("DATAREQUEST");
-  Serial.setTimeout(2000);
+  while (comm.available()) comm.read();
+  comm.println("DATAREQUEST");
+  comm.setTimeout(2000);
 
-  len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+  len = comm.readBytesUntil('\n', buf, sizeof(buf) - 1);
   buf[len] = '\0';
 
   if (len > 0) {
@@ -289,17 +351,23 @@ static TeensyMode negotiateMode() {
   return TeensyMode::FLIGHT;
 }
 
-// ── SHITL calibration state (declared here for switchToSHITL) ────
+// ── SHITL calibration state ──────────────────────────────────────
+// Outlier-reject cal: only at-rest frames (Z near gravity) feed the bias.
+// If the operator hits LAUNCH before cal finishes, burn frames are rejected
+// instead of pulling the bias 1-3 g high. After SIM_CAL_TIMEOUT we force-
+// complete with whatever good samples landed; if zero, cal stays NaN and
+// the controller refuses to run.
 static bool simCalibrated = false;
-static int simCalibrationCount = 0;
-static const int SIM_CAL_SAMPLES = 20;  // ~1s at 50ms loop interval
+static int simCalibrationCount = 0;        // good (at-rest) samples accumulated
+static int simCalibrationTotalCount = 0;   // total samples seen
+static const int SIM_CAL_SAMPLES = 20;     // good samples needed (~1 s)
+static const int SIM_CAL_TIMEOUT = 200;    // total samples before forcing (~10 s)
+static const float CAL_REST_TOLERANCE_G = 0.3f;
 
-// Ground truth from the dashboard. When the SHITL dashboard uses the 9-field
-// extended CSV (time, ax, ay, az, pressure, temp, alt_m, vel_ms, phase_code),
-// the Teensy runs its controller on those exact values instead of UKF +
-// state-machine-derived estimates. That makes SHITL_DEMO byte-for-byte
-// identical to the pure-Python demo in controller behavior. The 6-field
-// legacy protocol still works and falls back to UKF + state machine.
+// Optional dashboard-supplied ground truth. The 9-field CSV protocol (time,
+// ax/ay/az, pressure, temp, alt, vel, phase_code) lets SHITL run the controller
+// on the exact same inputs as the pure-Python demo. The 6-field legacy
+// protocol falls back to UKF + state machine.
 struct SimGroundTruth_t {
   float sim_time_s = 0.0f;
   float alt_m = 0.0f;
@@ -318,51 +386,120 @@ static States phaseCodeToState(int phase_code) {
   }
 }
 
+// Resets flight/state/filter/calibration without rebooting the MCU. Keeps the
+// WiFi AP + TCP client alive (hardware RESET drops them for ~15 s) and the SD
+// log file open. Drops a "# SOFT_RESET" marker line into the log so post-
+// flight tooling can split pre- and post-reset segments.
+static void restartStateMachine() {
+  FlightState = FlightState_t();
+  BrakeState = BrakeState_t();
+  I2CControl = I2CControl_t();
+  airbrakeController.reset();
+  altitudeFilter = UKF1D();
+  kinematic_vel = 0.0f;
+  resetStateMachineCounters();
+  armed = false;
+
+  airbrake_servo_1.setExtension(RocketConfig::SERVO_MIN_PCT);
+  airbrake_servo_2.setExtension(RocketConfig::SERVO_MIN_PCT);
+  BrakeState.pct = 0.0f;
+
+  // If we soft-reset mid-APOGEE the pyro may already be firing.
+  if (!shouldInhibitPyros()) primaryIgniter.stop();
+
+  char marker[48];
+  snprintf(marker, sizeof(marker), "# SOFT_RESET at millis=%lu", millis());
+  logging.log(marker);
+  logging.flush();
+
+  // Re-calibrate. SIM modes wait for fresh dashboard frames; real-sensor modes
+  // re-sample for ~1 s here and go to SENSOR_ERROR if calibration fails so we
+  // never fly on an implicit zero bias.
+  RefCalibration.pressure = 0.0f;
+  RefCalibration.temperature = 0.0f;
+  RefCalibration.accel_z_bias = 0.0f;
+  RefCalibration.accel_z_high_g_bias = 0.0f;
+
+  if (isSimMode(currentMode)) {
+    simCalibrated = false;
+    simCalibrationCount = 0;
+    simCalibrationTotalCount = 0;
+    BrakeState.hasCheckedForHorizontal = true;
+    state = States::IDLE;
+  } else {
+    bool cal_ok = calibrateSensors(lps22, &adxl345, &adxl375);
+    BrakeState.hasCheckedForHorizontal = false;
+    if (!cal_ok) {
+      failed_sensors++;
+      state = States::SENSOR_ERROR;
+    } else {
+      state = (failed_sensors > 0) ? States::SENSOR_ERROR : States::IDLE;
+    }
+  }
+}
+
 // ── Serial Command Handling ──────────────────────────────────────
 
+// Switches the firmware into SHITL or SHITL_DEMO. Resets the filter, sim
+// calibration counters, and controller; clears sticky arm; parks servos once
+// for SHITL_DEMO (driveServos suppresses motion afterwards).
 static void enterSHITL(TeensyMode target) {
   currentMode = target;
-  Serial.setTimeout(25);  // SHITL data arrives within a few ms; keep tight
+  comm.setTimeout(25);  // SHITL frames arrive within a few ms
   BrakeState.hasCheckedForHorizontal = true;
   simCalibrated = false;
   simCalibrationCount = 0;
+  simCalibrationTotalCount = 0;
   RefCalibration.pressure = 0;
   RefCalibration.temperature = 0;
-  RefCalibration.accel_z_bias = 0.0f;  // zeroed before accumulation
+  RefCalibration.accel_z_bias = 0.0f;
+  RefCalibration.accel_z_high_g_bias = 0.0f;
   altitudeFilter = UKF1D();
   FlightState.velocity = 0.0f;
-  SimTruth.valid = false;  // new dashboard session → re-detect protocol
+  SimTruth.valid = false;  // re-detect 6-vs-9-field protocol on new session
   airbrakeController.reset();
   state = States::IDLE;
+  armed = false;
   logging.setDebug(true);
   if (target == TeensyMode::SHITL_DEMO) {
-    // Park servos once on entry; driveServos() suppresses motion afterwards.
     airbrake_servo_1.setExtension(RocketConfig::SERVO_MIN_PCT);
     airbrake_servo_2.setExtension(RocketConfig::SERVO_MIN_PCT);
-    BrakeState.pct = 0.0f;  // 0% airbrake (servos parked at SERVO_MIN_PCT)
+    BrakeState.pct = 0.0f;
   }
   ackMode(target);
-  Serial.print(F("Mode: "));
-  Serial.println(modeToString(currentMode));
+  comm.print(F("Mode: "));
+  comm.println(modeToString(currentMode));
 }
 
+// Dispatch one already-newline-stripped command line from the dashboard.
+// Recognised commands:
+//   MODE,<name>     mode switch (also clears sticky arm)
+//   SERVO,<pct>     manual servo command (clamped)
+//   ARM / DISARM    sticky arm flag (gates apogee pyro)
+//   BEEP,ON|OFF     hold-to-beep buzzer
+//   ZERO            re-sample at-rest baseline (rocket must be stationary)
+//   RESET           hardware software-reset (drops WiFi for ~15 s)
+//   SOFT_RESET      restart state machine without rebooting
+//   GET,MODE        echo the active mode
+//   CHECK,SENSORS|CALIB|SD     pre-launch checklist queries
+//   LIST,SD / READ,SD,<name>   browse/download log files over the link
 static void handleSerialCommand(const char *line) {
   TeensyMode m;
   if (parseMode(line, &m)) {
     if (isSimMode(m)) {
       enterSHITL(m);
     } else {
-      // Beep the buzzer on a *transition* into FLIGHT (e.g. dashboard
-      // promoting the Teensy from SHITL to live). Only fires from ground
-      // states so we never burn 5 s of the main loop mid-flight.
+      // Beep on transitions *into* FLIGHT, and only from ground states so we
+      // never burn 5 s of the main loop mid-flight.
       bool entering_flight =
           (m == TeensyMode::FLIGHT) && (currentMode != TeensyMode::FLIGHT);
       currentMode = m;
+      armed = false;
       ackMode(m);
       if (entering_flight && state != States::SENSOR_ERROR &&
           (state == States::IDLE || state == States::AIRBRAKE_TEST ||
            state == States::BOOT || state == States::LANDED)) {
-        Serial.println(F("FLIGHT mode -- buzzer confirm"));
+        comm.println(F("FLIGHT mode -- buzzer confirm"));
         flightModeBuzzerConfirm();
       }
     }
@@ -372,36 +509,222 @@ static void handleSerialCommand(const char *line) {
     float pct = strtof(line + 6, nullptr);
     pct = constrain(pct, RocketConfig::SERVO_MIN_PCT, RocketConfig::SERVO_MAX_PCT);
     driveServos(pct);
+  } else if (strcmp(line, "ARM") == 0) {
+    armed = true;
+    comm.println(F("ARM_ACK"));
+  } else if (strcmp(line, "DISARM") == 0) {
+    armed = false;
+    comm.println(F("DISARM_ACK"));
+  } else if (strcmp(line, "BEEP,ON") == 0) {
+    // Hold-to-beep. Dashboard sends ON on mousedown, OFF on mouseup; if the
+    // connection drops mid-hold the next reconnect's OFF still wins.
+    tone(PinDefs.BUZZER, 2000);
+  } else if (strcmp(line, "BEEP,OFF") == 0) {
+    noTone(PinDefs.BUZZER);
+    digitalWrite(PinDefs.BUZZER, LOW);
   } else if (strcmp(line, "ZERO") == 0) {
-    // Press ZERO only when the rocket is stationary — samples for ~1s to
-    // capture the true at-rest pressure, temperature, and accel bias. The
-    // accel-bias correction kills the phantom 5-7 m/s velocity drift.
-    Serial.println(F("Zeroing sensors (~1s sample)..."));
+    // Re-capture at-rest baseline. Operator must hold the rocket stationary
+    // for the full ~1 s sample window or bias gets contaminated.
+    comm.println(F("Zeroing sensors (~1s sample)..."));
     RefCalibration.pressure = 0;
     RefCalibration.temperature = 0;
-    calibrateSensors(lps22, &adxl345);
+    bool ok = calibrateSensors(lps22, &adxl345, &adxl375);
     altitudeFilter = UKF1D();
     FlightState.velocity = 0.0f;
-    Serial.print(F("Zeroed: p_ref="));
-    Serial.print(RefCalibration.pressure, 2);
-    Serial.print(F(" mbar, accel_z_bias="));
-    Serial.print(RefCalibration.accel_z_bias, 4);
-    Serial.println(F(" g"));
+    if (!ok) {
+      comm.println(F("ZERO failed -- no valid baro samples"));
+    } else {
+      comm.print(F("Zeroed: p_ref="));
+      comm.print(RefCalibration.pressure, 2);
+      comm.print(F(" mbar, az_bias="));
+      comm.print(RefCalibration.accel_z_bias, 4);
+      comm.print(F(" g, az_hg_bias="));
+      comm.print(RefCalibration.accel_z_high_g_bias, 4);
+      comm.println(F(" g"));
+    }
   } else if (strcmp(line, "RESET") == 0) {
-    Serial.println(F("RESET_ACK"));
-    Serial.flush();
+    comm.println(F("RESET_ACK"));
+    comm.flush();
     delay(10);
-    SCB_AIRCR = 0x05FA0004;  // ARM software reset — same as power cycle
+    SCB_AIRCR = 0x05FA0004;  // Cortex-M software reset
+  } else if (strcmp(line, "GET,MODE") == 0) {
+    comm.print(F("Mode: "));
+    comm.println(modeToString(currentMode));
+  } else if (strcmp(line, "SOFT_RESET") == 0) {
+    comm.println(F("SOFT_RESET_BEGIN"));
+    restartStateMachine();
+    comm.print(F("SOFT_RESET_ACK,state="));
+    comm.print(stateToString(state));
+    comm.print(F(",calibrated="));
+    comm.print(RefCalibration.pressure > 0.0f ? 1 : 0);
+    comm.print(F(",failed="));
+    comm.print(failed_sensors);
+    comm.println();
+  } else if (strcmp(line, "CHECK,SENSORS") == 0) {
+    // Sample each chip 10× over 300 ms in real-sensor modes and report
+    // mean + range per channel. range > 0 proves the chip is updating; a
+    // stuck ADXL reading 0.000 g or a frozen LPS22 will show range=0.
+    // SIM modes emit a single snapshot.
+    constexpr int N = 10;
+    float p_min=1e9f,  p_max=-1e9f,  p_sum=0;
+    float T_min=1e9f,  T_max=-1e9f,  T_sum=0;
+    float ax_min=1e9f, ax_max=-1e9f, ax_sum=0;
+    float ay_min=1e9f, ay_max=-1e9f, ay_sum=0;
+    float az_min=1e9f, az_max=-1e9f, az_sum=0;
+    float axh_min=1e9f, axh_max=-1e9f, axh_sum=0;
+    float ayh_min=1e9f, ayh_max=-1e9f, ayh_sum=0;
+    float azh_min=1e9f, azh_max=-1e9f, azh_sum=0;
+    int samples = 0;
+
+    auto acc = [](float v, float &mn, float &mx, float &sm) {
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      sm += v;
+    };
+
+    if (isSimMode(currentMode)) {
+      // One snapshot from whatever the dashboard last fed us.
+      samples = 1;
+      p_min = p_max = p_sum = sensors.pressure;
+      T_min = T_max = T_sum = sensors.temperature;
+      ax_min = ax_max = ax_sum = sensors.accel_x;
+      ay_min = ay_max = ay_sum = sensors.accel_y;
+      az_min = az_max = az_sum = sensors.accel_z;
+      axh_min = axh_max = axh_sum = sensors.accel_x_high_g;
+      ayh_min = ayh_max = ayh_sum = sensors.accel_y_high_g;
+      azh_min = azh_max = azh_sum = sensors.accel_z_high_g;
+    } else {
+      for (int i = 0; i < N; i++) {
+        float p=0, T=0, ax=0, ay=0, az=0, axh=0, ayh=0, azh=0;
+        lps22.readPressure(&p);
+        lps22.readTemperature(&T);
+        adxl345.readAccelerometer(&ax, &ay, &az);
+        adxl375.readAccelerometer(&axh, &ayh, &azh);
+        acc(p,   p_min,   p_max,   p_sum);
+        acc(T,   T_min,   T_max,   T_sum);
+        acc(ax,  ax_min,  ax_max,  ax_sum);
+        acc(ay,  ay_min,  ay_max,  ay_sum);
+        acc(az,  az_min,  az_max,  az_sum);
+        acc(axh, axh_min, axh_max, axh_sum);
+        acc(ayh, ayh_min, ayh_max, ayh_sum);
+        acc(azh, azh_min, azh_max, azh_sum);
+        samples++;
+        delay(30);
+      }
+    }
+
+    float inv = samples > 0 ? 1.0f / (float)samples : 0.0f;
+    auto emit_ch = [&](const __FlashStringHelper* k_mean,
+                       const __FlashStringHelper* k_range,
+                       float sum, float mn, float mx, int dp) {
+      comm.print(k_mean); comm.print(sum * inv, dp);
+      comm.print(k_range); comm.print(mx - mn, dp + 1);
+    };
+    comm.print(F("CHECK_RESULT,SENSORS,n=")); comm.print(samples);
+    emit_ch(F(",p_mean="),    F(",p_range="),    p_sum,   p_min,   p_max,   2);
+    emit_ch(F(",T_mean="),    F(",T_range="),    T_sum,   T_min,   T_max,   2);
+    emit_ch(F(",ax_mean="),   F(",ax_range="),   ax_sum,  ax_min,  ax_max,  3);
+    emit_ch(F(",ay_mean="),   F(",ay_range="),   ay_sum,  ay_min,  ay_max,  3);
+    emit_ch(F(",az_mean="),   F(",az_range="),   az_sum,  az_min,  az_max,  3);
+    emit_ch(F(",axh_mean="),  F(",axh_range="),  axh_sum, axh_min, axh_max, 3);
+    emit_ch(F(",ayh_mean="),  F(",ayh_range="),  ayh_sum, ayh_min, ayh_max, 3);
+    emit_ch(F(",azh_mean="),  F(",azh_range="),  azh_sum, azh_min, azh_max, 3);
+    comm.print(F(",failed=")); comm.print(failed_sensors);
+    comm.println();
+  } else if (strcmp(line, "CHECK,CALIB") == 0) {
+    // p_ref stays 0.0 until calibrateSensors lands at least one good sample.
+    bool calibrated = (RefCalibration.pressure > 0.0f);
+    comm.print(F("CHECK_RESULT,CALIB,calibrated="));
+    comm.print(calibrated ? 1 : 0);
+    comm.print(F(",p_ref="));
+    comm.print(RefCalibration.pressure, 2);
+    comm.print(F(",T_ref="));
+    comm.print(RefCalibration.temperature, 2);
+    comm.print(F(",az_bias="));
+    comm.print(RefCalibration.accel_z_bias, 4);
+    comm.print(F(",az_hg_bias="));
+    comm.print(RefCalibration.accel_z_high_g_bias, 4);
+    comm.println();
+  } else if (strcmp(line, "CHECK,SD") == 0) {
+    // Marker write + flush. Catches a card that opened OK at boot but has
+    // since been pulled or filled up.
+    bool ok = logging.selfTest();
+    comm.print(F("CHECK_RESULT,SD,ok="));
+    comm.print(ok ? 1 : 0);
+    comm.print(F(",file="));
+    comm.println(logging.fileName());
+  } else if (strcmp(line, "LIST,SD") == 0) {
+    // BEGIN/END markers let the dashboard demux this from telemetry.
+    // Hidden files (".DS_Store" etc) are filtered out.
+    comm.println(F("SD_LIST_BEGIN"));
+    File root = SD.open("/");
+    int count = 0;
+    if (root) {
+      while (true) {
+        File entry = root.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+          const char* name = entry.name();
+          if (name[0] != '.') {
+            comm.print(name);
+            comm.print(",");
+            comm.print((unsigned long)entry.size());
+            comm.println();
+            count++;
+          }
+        }
+        entry.close();
+      }
+      root.close();
+    }
+    comm.print(F("SD_LIST_END,"));
+    comm.print(count);
+    comm.println();
+  } else if (strncmp(line, "READ,SD,", 8) == 0) {
+    // Streams the named file as SD_LINE,<content> rows wrapped in
+    // SD_FILE_BEGIN/END. Flush the live log first so a download of the
+    // current LOG###.TXT sees pending writes. Calling comm.poll() inside
+    // the loop keeps the WiFi AP alive during long downloads.
+    const char* fname = line + 8;
+    logging.flush();
+    File f = SD.open(fname, FILE_READ);
+    if (!f) {
+      comm.print(F("SD_FILE_ERR,not_found,"));
+      comm.println(fname);
+    } else {
+      uint32_t size = f.size();
+      comm.print(F("SD_FILE_BEGIN,"));
+      comm.print(fname);
+      comm.print(",");
+      comm.print(size);
+      comm.println();
+      char linebuf[280];
+      while (f.available()) {
+        size_t n = f.readBytesUntil('\n', linebuf, sizeof(linebuf) - 1);
+        while (n > 0 && (linebuf[n-1] == '\r' || linebuf[n-1] == '\n')) n--;
+        linebuf[n] = '\0';
+        comm.print(F("SD_LINE,"));
+        comm.println(linebuf);
+        comm.poll();
+      }
+      f.close();
+      comm.print(F("SD_FILE_END,"));
+      comm.println(fname);
+    }
   }
 }
 
-// Non-blocking serial line reader for FLIGHT and TEST modes
+// Non-blocking line reader. Accumulates bytes from comm into _cmdBuf until
+// CR/LF, then dispatches to handleSerialCommand. Used in modes where the
+// dashboard sends commands but does NOT push CSV sensor frames.
 static char _cmdBuf[64];
 static int _cmdPos = 0;
 
 static void checkSerialCommands() {
-  while (Serial.available()) {
-    char c = Serial.read();
+  while (comm.available()) {
+    int cr = comm.read();
+    if (cr < 0) break;
+    char c = (char)cr;
     if (c == '\n' || c == '\r') {
       if (_cmdPos > 0) {
         _cmdBuf[_cmdPos] = '\0';
@@ -418,6 +741,8 @@ static void checkSerialCommands() {
 
 // ── Read Real Sensors ────────────────────────────────────────────
 
+// Polls every sensor on the I2C bus, fills the global SensorData_t, and
+// returns the AGL altitude derived from the latest pressure reading.
 static float readRealSensors() {
   adxl345.readAccelerometer(&sensors.accel_x, &sensors.accel_y, &sensors.accel_z);
   adxl375.readAccelerometer(&sensors.accel_x_high_g, &sensors.accel_y_high_g, &sensors.accel_z_high_g);
@@ -436,26 +761,34 @@ static float readRealSensors() {
 
 // ── Read Simulated Sensors (SHITL mode) ──────────────────────────
 
+// Distinguishes dashboard control lines from CSV sensor frames in SHITL.
+// Must list every command the operator can send during SHITL or those
+// commands silently no-op against the sensor-row parser.
 static bool isDashboardCommand(const char *line) {
   return strncmp(line, "SERVO,", 6) == 0 || strcmp(line, "ZERO") == 0 ||
-         strcmp(line, "RESET") == 0 || strncmp(line, "MODE,", 5) == 0;
+         strcmp(line, "RESET") == 0 || strcmp(line, "SOFT_RESET") == 0 ||
+         strncmp(line, "MODE,", 5) == 0 || strcmp(line, "GET,MODE") == 0 ||
+         strncmp(line, "BEEP,", 5) == 0 || strcmp(line, "ARM") == 0 ||
+         strcmp(line, "DISARM") == 0 || strncmp(line, "CHECK,", 6) == 0 ||
+         strncmp(line, "LIST,", 5) == 0 || strncmp(line, "READ,", 5) == 0;
 }
 
+// Pulls one CSV sensor frame from the dashboard. Supports both the 9-field
+// extended protocol (time, ax, ay, az, p, T, alt, vel, phase_code → ground
+// truth available, controller skips UKF) and the 6-field legacy protocol
+// (sensors only → UKF + state machine derive altitude/velocity/state).
+// Inline command lines are dispatched as they arrive (capped at 2 per call
+// so command spam can't starve sensor data).
 static float readSimulatedSensors() {
-  Serial.println("DATAREQUEST");
+  comm.println("DATAREQUEST");
 
-  // Extended protocol is 9 fields (legacy is 6):
-  //   time_s, ax, ay, az, pressure_mbar, temp_c, alt_m, vel_ms, phase_code
-  // Bigger buffer so a 9-field line with float formatting never gets split.
   char buf[192];
   float values[9];
   int gotCount = 0;
 
-  // Worst case: 3 reads × 25ms = 75ms. Commands cap at 2 so sensor data can't
-  // be starved by command spam.
   int commands_handled = 0;
   for (int attempts = 0; attempts < 3; attempts++) {
-    int len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
+    int len = comm.readBytesUntil('\n', buf, sizeof(buf) - 1);
     if (len == 0) break;
     buf[len] = '\0';
 
@@ -489,8 +822,7 @@ static float readSimulatedSensors() {
   sensors.accel_y_high_g = sensors.accel_y;
   sensors.accel_z_high_g = sensors.accel_z;
 
-  // Extended protocol: dashboard provided ground truth so the controller runs
-  // on the same inputs as the pure-Python demo. Skip calibration + UKF path.
+  // 9-field protocol: ground truth available, skip calibration + UKF.
   if (gotCount >= 9) {
     SimTruth.sim_time_s = values[0];
     SimTruth.alt_m      = values[6];
@@ -500,24 +832,44 @@ static float readSimulatedSensors() {
     return SimTruth.alt_m;
   }
 
-  // Legacy 6-field path: calibrate ground reference, then derive altitude
-  // from pressure via hypsometric formula.
+  // 6-field protocol: accumulate at-rest samples to calibrate, then return
+  // altitude derived from pressure.
   SimTruth.valid = false;
   if (!simCalibrated) {
-    RefCalibration.pressure += sensors.pressure;
-    RefCalibration.temperature += sensors.temperature + CELSIUS_TO_KELVIN;
-    RefCalibration.accel_z_bias += sensors.accel_z;
-    simCalibrationCount++;
-    if (simCalibrationCount >= SIM_CAL_SAMPLES) {
-      RefCalibration.pressure /= (float)SIM_CAL_SAMPLES;
-      RefCalibration.temperature /= (float)SIM_CAL_SAMPLES;
-      RefCalibration.accel_z_bias /= (float)SIM_CAL_SAMPLES;
+    simCalibrationTotalCount++;
+    // Reject burn-phase frames so an early LAUNCH doesn't poison the bias.
+    bool at_rest = fabsf(sensors.accel_z - 1.0f) < CAL_REST_TOLERANCE_G &&
+                   fabsf(sensors.accel_x) < CAL_REST_TOLERANCE_G &&
+                   fabsf(sensors.accel_y) < CAL_REST_TOLERANCE_G;
+    if (at_rest) {
+      RefCalibration.pressure += sensors.pressure;
+      RefCalibration.temperature += sensors.temperature + CELSIUS_TO_KELVIN;
+      RefCalibration.accel_z_bias += sensors.accel_z;
+      RefCalibration.accel_z_high_g_bias += sensors.accel_z_high_g;
+      simCalibrationCount++;
+    }
+    bool got_enough = simCalibrationCount >= SIM_CAL_SAMPLES;
+    bool timed_out = simCalibrationTotalCount >= SIM_CAL_TIMEOUT;
+    if (got_enough || (timed_out && simCalibrationCount > 0)) {
+      RefCalibration.pressure /= (float)simCalibrationCount;
+      RefCalibration.temperature /= (float)simCalibrationCount;
+      RefCalibration.accel_z_bias /= (float)simCalibrationCount;
+      RefCalibration.accel_z_high_g_bias /= (float)simCalibrationCount;
       simCalibrated = true;
-      Serial.print(F("SHITL calibrated: p_ref="));
-      Serial.print(RefCalibration.pressure, 2);
-      Serial.print(F(" mbar, accel_z_bias="));
-      Serial.print(RefCalibration.accel_z_bias, 4);
-      Serial.println(F(" g"));
+      comm.print(F("SHITL cal "));
+      comm.print(timed_out ? F("FORCED (partial): ") : F("OK: "));
+      comm.print(simCalibrationCount);
+      comm.print(F("/"));
+      comm.print(simCalibrationTotalCount);
+      comm.print(F(" good, p_ref="));
+      comm.print(RefCalibration.pressure, 2);
+      comm.print(F(" mbar, accel_z_bias="));
+      comm.print(RefCalibration.accel_z_bias, 4);
+      comm.println(F(" g"));
+    } else if (timed_out) {
+      // 10 s elapsed with zero at-rest samples → refuse to fly on a bad bias.
+      comm.println(F("SHITL cal FAILED: no at-rest samples after 10s — switch to TEST mode and retry"));
+      simCalibrationTotalCount = 0;  // re-arm the timeout for another window
     }
     return NAN;
   }
@@ -525,8 +877,23 @@ static float readSimulatedSensors() {
   return altitudeDelta(sensors.pressure, sensors.temperature + CELSIUS_TO_KELVIN);
 }
 
+// Updates max_velocity and max_accel_g every loop so a dashboard reconnecting
+// after landing sees the peak values immediately. max_altitude is maintained
+// by the state machine (handleAscent) and the SHITL ground-truth path.
+static void updateFlightMaxima() {
+  float v = fabsf(FlightState.velocity);
+  if (v > FlightState.max_velocity) FlightState.max_velocity = v;
+  float az = fmaxf(fabsf(sensors.accel_z), fabsf(sensors.accel_z_high_g));
+  if (az > FlightState.max_accel_g) FlightState.max_accel_g = az;
+}
+
 // ── I2C Control Packet (FLIGHT mode only) ────────────────────────
 
+// Sends the latest sensor frame to the control Teensy at CTRL_TEENSY_ADDR
+// (which runs the apogee predictor + servo controller) and reads back the
+// commanded servo angles + diagnostics. After I2C_FAIL_THRESHOLD consecutive
+// transmission failures we latch into fallback mode and runFallbackSweep
+// takes over with an open-loop sweep.
 void sendControlPacket(float altitude) {
   if (currentMode != TeensyMode::FLIGHT) return;
   if (!USE_CONTROL || I2CControl.fallback || (millis() - I2CControl.lastSend < CONTROL_INTERVAL_MS)) return;
@@ -579,12 +946,13 @@ void sendControlPacket(float altitude) {
 
 // ── Local Controller (SHITL mode) ────────────────────────────────
 
+// Runs the on-Teensy AirbrakeController + Cd-to-servo-angle lookup in SHITL.
+// When the dashboard provides ground truth, uses the sim clock so the
+// post-launch delay, apogee timer, etc. line up with Python's sim_time.
 static void runLocalController(float altitude) {
   float vel = FlightState.velocity;
   float alt_msl = altitude + RocketConfig::LAUNCH_SITE_ALT_MSL_M;
   float sos = Atmosphere::speedOfSound(alt_msl);
-  // When running on dashboard ground truth, use the sim clock so
-  // POST_LAUNCH_DELAY_S etc. line up with Python's sim_time exactly.
   float time_s = SimTruth.valid ? SimTruth.sim_time_s : millis() / 1000.0f;
   float dt = LOOP_INTERVAL_MS / 1000.0f;
 
@@ -607,15 +975,15 @@ static void runLocalController(float altitude) {
 }
 
 // ── Fallback Sweep (open-loop, FLIGHT mode only) ────────────────
-// Last-resort sweep if I2C control Teensy is unavailable
 
+// Open-loop airbrake sweep for the case where the control Teensy is
+// unreachable. Holds off until well past burnout, then steps the brakes
+// AIRBRAKE_MIN ↔ AIRBRAKE_MAX on a fixed cadence. NOT apogee-targeted.
 static void runFallbackSweep() {
   if (millis() - FlightState.ignition_time < FALLBACK_IGNITION_DELAY_MS &&
       millis() - FlightState.motor_burnout_time < FALLBACK_BURNOUT_DELAY_MS) {
     return;
   }
-  // BrakeState.pct and AIRBRAKE_MIN/MAX both live in airbrake-% [0..100].
-  // Convert to servo-% only at the driveServos boundary.
   if (millis() - BrakeState.last_update <
       (BrakeState.pct <= AIRBRAKE_MIN ? FALLBACK_SWEEP_PAUSE_MS : FALLBACK_SWEEP_INTERVAL_MS)) {
     return;
@@ -634,10 +1002,15 @@ static void runFallbackSweep() {
 
 // ── Mode-Specific Loop Functions ─────────────────────────────────
 
+// "On the pad" states where altitude must read exactly 0 — keeps the dashboard
+// chart and the predictor's pre-launch math stable before liftoff.
 static bool isOnPad() {
   return state == States::IDLE || state == States::AIRBRAKE_TEST || state == States::SENSOR_ERROR;
 }
 
+// FLIGHT loop: real sensors → state machine → during ASCENT, send sensor
+// frame to control Teensy and apply the returned servo command, falling back
+// to open-loop sweep on I2C failure.
 static void loopFlight() {
   float raw_alt = readRealSensors();
   if (isnan(raw_alt)) return;
@@ -656,9 +1029,14 @@ static void loopFlight() {
     }
   }
 
-  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
+  updateFlightMaxima();
+  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
+// SHITL loop: pull a sensor frame from the dashboard, then either trust the
+// supplied ground truth (9-field) or derive everything via UKF + state machine
+// (6-field). Local controller + servo apply on every tick — controller
+// internally retracts during PREFLIGHT/BURN.
 static void loopSHITL() {
   statusIndicator.rainbow();
 
@@ -667,50 +1045,43 @@ static void loopSHITL() {
 
   float altitude;
   if (SimTruth.valid) {
-    // Ground-truth path: controller runs on the same inputs as the
-    // pure-Python demo, so SHITL_DEMO and SHITL produce identical commands
-    // to the non-Teensy demo. SHITL still drives servos; SHITL_DEMO parks.
     state = phaseCodeToState(SimTruth.phase_code);
     altitude = SimTruth.alt_m;
     FlightState.velocity = SimTruth.vel_ms;
     FlightState.max_altitude = fmaxf(FlightState.max_altitude, altitude);
   } else {
-    // Legacy 6-field protocol: UKF + state machine derive alt/vel/state
-    // from sensor data.
-    altitude = isOnPad() ? 0.0f : filterAltitude(raw_alt);
+    // Run UKF + state machine every tick — including pre-launch — so velocity
+    // is already tracking the burn by the time the predictor needs it.
+    altitude = filterAltitude(raw_alt);
     updateStateMachine(altitude);
   }
 
-  // Call the controller every tick — it internally retracts in PREFLIGHT/BURN.
-  // Matches how the Python demo invokes AirbrakeController.update every step.
   runLocalController(altitude);
 
-  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
+  updateFlightMaxima();
+  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
+// TEST loop: real sensors + UKF, no state machine. Used for manual servo
+// commands and filter-tuning bench runs.
 static void loopTest() {
-  // Explicit LED every tick so mode switches out of SHITL (rainbow PWM) don't
-  // leave the LED frozen on the last PWM frame.
+  // Drive the LED every tick so leaving SHITL (rainbow PWM) clears cleanly.
   statusIndicator.solid(StatusIndicator::BLUE);
 
   float raw_alt = readRealSensors();
   if (isnan(raw_alt)) return;
 
-  // Filter unconditionally — TEST mode exists to expose UKF behavior for tuning.
   float altitude = filterAltitude(raw_alt);
 
   checkSerialCommands();
-  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
+  updateFlightMaxima();
+  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
-// SENSOR_MOVING: real sensors + UKF, no state machine, no servo motion.
-// Intended for picking up / moving / shaking the rocket on the ground to
-// watch the state estimate (altitude, velocity, acceleration) and capture
-// a file to SD in the same CSV format as FLIGHT. Servos stay parked at
-// SERVO_MIN_PCT (set during setup()); this loop never calls driveServos.
+// SENSOR_MOVING loop: real sensors + UKF, no state machine, no servo motion.
+// For ground tests where the rocket is moved/shaken to watch the estimator.
+// Logs CSV in the same format as FLIGHT so the same tooling parses it.
 static void loopSensorMoving() {
-  // Solid ORANGE distinguishes SENSOR_MOVING from TEST (BLUE) and IDLE (GREEN).
-  // Driven every tick so switching out of SHITL (rainbow PWM) updates cleanly.
   statusIndicator.solid(StatusIndicator::ORANGE);
 
   float raw_alt = readRealSensors();
@@ -719,46 +1090,63 @@ static void loopSensorMoving() {
   float altitude = filterAltitude(raw_alt);
 
   checkSerialCommands();
-  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state);
+  updateFlightMaxima();
+  logging.logTelemetry(altitude, FlightState.velocity, sensors, BrakeState, I2CControl, state, armed);
 }
 
 // ── Setup ────────────────────────────────────────────────────────
+//
+// Boot sequence:
+//   1. Serial + GPIO init.
+//   2. Wait up to 3 s for USB host (flight continues without it).
+//   3. Bring up the AirLift WiFi AP (transparent fallback to USB-only).
+//   4. Negotiate mode with the dashboard (or default to FLIGHT).
+//   5. I2C + sensor init + at-rest calibration. Failures → SENSOR_ERROR.
+//   6. SD card open, log header written.
+//   7. Servos parked at SERVO_MIN_PCT.
+//   8. FLIGHT-mode buzzer confirm (skipped on SENSOR_ERROR).
+//
+// Worst-case setup time on the pad is ~22 s (3 s serial + AirLift + 4 s
+// sensor settle + up to 10 s SD retry + 5 s buzzer). Plan the timeline.
 
 void setup() {
-  Serial.begin(115200);
+  comm.beginSerial(115200);
 
   pinMode(PinDefs.ARM, INPUT_PULLUP);
   pinMode(PinDefs.IGNITER_0, OUTPUT);
   pinMode(PinDefs.IGNITER_1, OUTPUT);
   pinMode(PinDefs.BUZZER, OUTPUT);
-  digitalWrite(PinDefs.BUZZER, LOW);  // silent until flight-mode confirm beep
+  digitalWrite(PinDefs.BUZZER, LOW);
 
-  // Wait for USB serial with timeout -- flight continues without USB host
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) {
     statusIndicator.solid(StatusIndicator::RED);
   }
   statusIndicator.solid(StatusIndicator::RED);
 
-  // Negotiate operating mode with dashboard (if connected)
-  if (Serial) {
+  // AirLift comes up BEFORE mode negotiation so a WiFi dashboard can
+  // participate in the READY/MODE handshake. Three short beeps confirm
+  // the AP is listening; absence of beeps = USB-only mode.
+  if (comm.beginWiFi("AirbrakesRocket", "irec202630k", 4040)) {
+    wifiBootBuzzerConfirm();
+  }
+
+  if (comm.connected()) {
     currentMode = negotiateMode();
   }
 
-  Serial.print(F("Mode: "));
-  Serial.println(modeToString(currentMode));
+  comm.print(F("Mode: "));
+  comm.println(modeToString(currentMode));
 
-  // I2C bus
   Wire.setSDA(PinDefs.SDA);
   Wire.setSCL(PinDefs.SCL);
   Wire.begin();
   Wire.setClock(100000);
 
-  delay(4000);  // allow sensors to power up
+  delay(4000);  // sensor power-up settle
 
-  // SD card — retry for ~10 s, then continue so a missing card doesn't
-  // strand the Teensy on the pad with a RED LED. Flight still works; only
-  // the SD log is lost.
+  // Retry SD for ~10 s so a slow card insertion doesn't strand the Teensy.
+  // After that, continue without a log rather than locking on RED.
   bool sd_ok = false;
   for (int i = 0; i < 10 && !sd_ok; i++) {
     sd_ok = logging.begin();
@@ -774,7 +1162,6 @@ void setup() {
     Serial.println(F("SD card init failed -- continuing without log"));
   }
 
-  // Initialize real sensors for FLIGHT and TEST modes
   if (!isSimMode(currentMode)) {
     initSensor(adxl345, "ADXL345");
     initSensor(adxl375, "ADXL375");
@@ -782,38 +1169,43 @@ void setup() {
 #if USE_BNO080
     initSensor(bno080, "BNO080");
 #endif
-    calibrateSensors(lps22, &adxl345);
+    // No silent fly-with-zero-bias: failure here promotes to SENSOR_ERROR
+    // below. Without this, an uncancelled 1 g of resting accel integrates
+    // into ~9.8 m/s² of phantom upward velocity per tick.
+    if (!calibrateSensors(lps22, &adxl345, &adxl375)) {
+      Serial.println(F("Sensor calibration failed -- no valid baro samples"));
+      failed_sensors++;
+    }
   }
 
-  // SHITL-specific setup (both SHITL and SHITL_DEMO)
   if (isSimMode(currentMode)) {
-    Serial.setTimeout(100);  // fast timeout for SHITL data reads
-    BrakeState.hasCheckedForHorizontal = true;  // skip horizontal detect
+    comm.setTimeout(100);
+    BrakeState.hasCheckedForHorizontal = true;
   }
 
-  // Enable serial telemetry when USB host is connected (for dashboard monitoring)
-  if (Serial) {
+  if (comm.connected()) {
     logging.setDebug(true);
   }
 
-  // Log header
+  // CSV column header. Schema is append-only — old dashboards parsing the
+  // first 29 fields keep working; new fields read from column 30 onward.
   logging.log(
       "Time,Xg,Yg,Zg,Xg_high,Yg_high,Zg_high,Pressure,Temperature,Altitude,"
       "BNO_X,BNO_Y,BNO_Z,BNO_I,BNO_J,BNO_K,BNO_Real,State,"
       "Airbrake_pct,Airbrake_dir,Predicted_Apogee,Cd_Add_Cmd,"
       "I2C_Fallback,I2C_FailCount,Potentiometer,Velocity,"
-      "Target_Cd_Raw,Apo_No_Brakes,Apo_Max_Brakes");
+      "Target_Cd_Raw,Apo_No_Brakes,Apo_Max_Brakes,Armed,"
+      "Max_Altitude,Max_Velocity,Max_Accel_g,Ignition_Time_ms,Apogee_Time_ms");
   logging.flush();
 
-  // Servo init LAST -- SD.begin() internally calls SPI.begin() which claims pin 10
+  // Servos attach LAST: SD.begin() calls SPI.begin() which claims pin 10,
+  // and the Servo library has its own pin-claim that must run after.
   airbrake_servo_1.begin(PinDefs.SERVO);
   airbrake_servo_2.begin(PinDefs.SERVO_2);
-  // Park at mechanical minimum instead of the Bilda default (0%).
   airbrake_servo_1.setExtension(RocketConfig::SERVO_MIN_PCT);
   airbrake_servo_2.setExtension(RocketConfig::SERVO_MIN_PCT);
-  BrakeState.pct = 0.0f;  // 0% airbrake (servos parked at SERVO_MIN_PCT)
+  BrakeState.pct = 0.0f;
 
-  // Set initial state
   if (failed_sensors > 0 && !isSimMode(currentMode)) {
     statusIndicator.solid(StatusIndicator::WHITE);
     Serial.println(F("Setup failed -- sensor error"));
@@ -824,8 +1216,8 @@ void setup() {
     state = States::IDLE;
   }
 
-  // FLIGHT mode confirmation: 5 on/off buzzer cycles over 5 s. Skip on
-  // SENSOR_ERROR so the WHITE LED + silence unambiguously flags the fault.
+  // FLIGHT confirm beep. Skip on SENSOR_ERROR so the WHITE LED + silence
+  // is unambiguous for fault diagnosis on the pad.
   if (currentMode == TeensyMode::FLIGHT && state != States::SENSOR_ERROR) {
     Serial.println(F("FLIGHT mode -- buzzer confirm"));
     flightModeBuzzerConfirm();
@@ -833,18 +1225,27 @@ void setup() {
 }
 
 // ── Main Loop ────────────────────────────────────────────────────
+//
+// 50 ms tick (LOOP_INTERVAL_MS). Each tick:
+//   1. Pump WiFi accept / client-alive bookkeeping.
+//   2. Re-enable telemetry streaming if a transport came online post-boot.
+//   3. Watch for USB unplug (announce "on battery" with the 8-beep cadence).
+//   4. Dispatch to the active mode's loop function.
 
 void loop() {
   unsigned long now = millis();
   if (now - last_loop_time < LOOP_INTERVAL_MS) return;
   last_loop_time = now;
 
-  // USB-unplug watcher (FLIGHT mode only). When the laptop cable is pulled
-  // before launch, announce "on internal power" with 8 short beeps so the
-  // operator has an audible confirmation that the Teensy is still running on
-  // battery and the state handlers are still refreshing the LED. Only fires
-  // from ground states so we never burn ~4 s of the main loop mid-flight if
-  // the connector happens to rip loose under motor g-load.
+  comm.poll();
+
+  static bool commWasConnected = false;
+  bool commNow = comm.connected();
+  if (commNow && !commWasConnected) logging.setDebug(true);
+  commWasConnected = commNow;
+
+  // FLIGHT-only USB-unplug watcher, gated to ground states so we never burn
+  // ~4 s of the main loop mid-flight if the connector tears loose under load.
   static bool usbWasConnected = false;
   bool usbNow = (bool)Serial;
   if (currentMode == TeensyMode::FLIGHT && usbWasConnected && !usbNow &&
