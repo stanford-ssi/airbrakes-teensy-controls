@@ -166,6 +166,17 @@ void Logging::logTelemetry(float altitude, float velocity, const SensorData_t &s
   buf.field(FlightState.max_accel_g, 2);
   buf.field((int)FlightState.ignition_time);
   buf.field((int)FlightState.fire_time);
+  // Active controller target apogee (m AGL). Drops from primary to fallback
+  // tier 2 / tier 3 if evaluateFallbackTarget() lowers it; otherwise constant
+  // at primary.
+  buf.field(i2c.active_target_alt, 1);
+  // Selected fallback tier (1 = primary 30k, 2 = fallback 28.5k, 3 = deep
+  // fallback 26k). Defaults to 1 before the 20k AGL gate fires.
+  buf.field(FlightState.fallback_tier);
+  // apo_no_brakes value the 20k AGL gate consumed (m AGL). 0 until the gate
+  // fires; afterwards constant. Tier is selected by comparing this to
+  // (primary − margin) and (fallback − margin).
+  buf.field(FlightState.fallback_apo_at_decision_m, 1);
   log(buf.str());
 
   if (millis() - lastFlush > 1000) {

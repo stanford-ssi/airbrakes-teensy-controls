@@ -69,8 +69,10 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
         return cd_add_cmd_;
     }
 
-    // Above target and still ascending, deploy full brakes immediately
-    if (alt_agl > RocketConfig::TARGET_ALT_AGL_M && vel > 0.0f) {
+    // Above target and still ascending, deploy full brakes immediately.
+    // Honours target_alt_ so the fallback-target latch dumps brakes the
+    // moment we cross the lowered target, not the original primary.
+    if (alt_agl > target_alt_ && vel > 0.0f) {
         state_ = CTRL_FULL;
         cd_add_cmd_ = RocketConfig::MAX_CD_ADD;
         predicted_apogee_ = alt_agl;
@@ -83,10 +85,12 @@ float AirbrakeController::update(float alt_agl, float vel, float accel,
         predicted_apogee_ = alt_agl;
         target_cd = RocketConfig::MAX_CD_ADD;
     } else {
-        // Subsonic coast, run apogee predictor to find required Cd_add
+        // Subsonic coast, run apogee predictor to find required Cd_add.
+        // Uses target_alt_ rather than the constant so the fallback-target
+        // latch retargets the search without touching the controller body.
         ApogeePredictor::Result result = predictor_.predict(
             alt_agl, vel, RocketConfig::LAUNCH_SITE_ALT_MSL_M,
-            RocketConfig::TARGET_ALT_AGL_M);
+            target_alt_);
 
         predicted_apogee_ = result.predicted_apogee;
         target_cd = result.cd_add;

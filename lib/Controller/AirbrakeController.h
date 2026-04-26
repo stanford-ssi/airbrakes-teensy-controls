@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "ApogeePredictor.h"
+#include "RocketConfig.h"
 
 class AirbrakeController {
 public:
@@ -29,6 +30,14 @@ public:
     float predictedApogee() const { return predicted_apogee_; }
     State controllerState() const { return state_; }
 
+    // Active target apogee (m AGL). Defaults to RocketConfig::TARGET_ALT_AGL_M
+    // (primary). The flight loop may lower it to the fallback target mid-coast
+    // if the rocket is predicted to undershoot primary; once changed it stays
+    // changed until reset(). Used by predict() and the over-target full-brakes
+    // gate so both honour whichever target is currently active.
+    float targetAltitude() const { return target_alt_; }
+    void setTargetAltitude(float t) { target_alt_ = t; }
+
     // Diagnostics — set by the last predict() call. Zero when the controller
     // isn't actively predicting (retract / descent / above-target branches).
     // Logged on every telemetry frame so the dashboard can compare against the
@@ -51,6 +60,7 @@ public:
         last_target_cd_raw_ = 0.0f;
         last_apo_no_ = 0.0f;
         last_apo_max_ = 0.0f;
+        target_alt_ = RocketConfig::TARGET_ALT_AGL_M;
     }
 
 private:
@@ -66,4 +76,7 @@ private:
     float last_target_cd_raw_ = 0.0f;
     float last_apo_no_ = 0.0f;
     float last_apo_max_ = 0.0f;
+    // Currently-active target apogee (m AGL). Mutable via setTargetAltitude
+    // for the fallback-target latch in main.cpp.
+    float target_alt_ = RocketConfig::TARGET_ALT_AGL_M;
 };

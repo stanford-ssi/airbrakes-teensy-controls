@@ -1,19 +1,4 @@
-// State machine for one flight, driven once per main loop tick.
-//
-// Transitions: BOOT → IDLE → (AIRBRAKE_TEST | IGNITION) → ASCENT → APOGEE
-//                                                              → DESCENT → LANDED
-//              SENSOR_ERROR is a terminal sink set during setup() / SOFT_RESET
-//              when calibration fails.
-//
-// Per-state LED color (set every tick by the handler):
-//   SENSOR_ERROR  WHITE     IGNITION  ORANGE
-//   IDLE          GREEN     ASCENT    RED
-//   AIRBRAKE_TEST BLUE      APOGEE    RED
-//   DESCENT       BLUE      LANDED    GREEN
-//
-// Pyro safety: handleIdle only HW-arms the igniter when isArmed() &&
-// !shouldInhibitPyros(). handleApogee re-checks isArmed() before firing so a
-// mid-flight DISARM still aborts the pyro.
+// One-flight state machine. Called once per 50 ms loop tick.
 
 #include <Arduino.h>
 #include <Globals.h>
@@ -25,18 +10,13 @@ static States handleSensorError() {
   return States::SENSOR_ERROR;
 }
 
-// IDLE: waiting on the pad. On the first tick we check orientation — if the
-// rocket is horizontal we sweep the airbrakes as a ground test. Otherwise we
-// poll for ignition (sustained accel_z above threshold).
+// IDLE waits for launch. A horizontal boot enters the bench sweep instead.
 static States handleIdle() {
   statusIndicator.solid(StatusIndicator::GREEN);
 
   if (sensors.accel_z > IGNITION_ACCEL_THRESHOLD) {
     FlightState.ignition_time = millis();
     FlightState.velocity = 0.0f;
-    // Two gates required to HW-arm the apogee igniter:
-    //   shouldInhibitPyros — never energize a real pyro from a SHITL sim.
-    //   isArmed            — operator must have explicitly armed via dashboard.
     if (!shouldInhibitPyros() && isArmed()) {
       primaryIgniter.arm();
     }
@@ -44,7 +24,6 @@ static States handleIdle() {
   }
 
   if (!BrakeState.hasCheckedForHorizontal) {
-    // Z is the thrust axis: |Z| dominates when vertical.
     if (abs(sensors.accel_x) > abs(sensors.accel_z) ||
         abs(sensors.accel_y) > abs(sensors.accel_z)) {
       BrakeState.direction = 1;
@@ -58,9 +37,7 @@ static States handleIdle() {
   return States::IDLE;
 }
 
-// AIRBRAKE_TEST: ground demo, ramps the brakes between AIRBRAKE_MIN/MAX.
-// Terminal — no exit transition. Rocket must boot vertical to ever reach
-// IDLE→IGNITION; this state is for bench/horizontal testing only.
+// Bench-only sweep. Terminal until reset or mode change.
 static States handleAirbrakeTest() {
   statusIndicator.solid(StatusIndicator::BLUE);
 
@@ -81,10 +58,7 @@ static States handleAirbrakeTest() {
   return States::AIRBRAKE_TEST;
 }
 
-// IGNITION: motor burning. Exit on burnout — accel_z < 0 for 3 consecutive
-// samples (~150 ms). The 3-sample debounce prevents a single noisy reading
-// or thrust dip from tripping the UKF reseed + sensor-weighting change
-// mid-burn.
+// Burnout is three consecutive negative thrust-axis accel samples.
 static int burnoutConfirmCount = 0;
 static const int BURNOUT_CONFIRM_THRESHOLD = 3;
 
@@ -105,21 +79,12 @@ static States handleIgnition() {
   return States::IGNITION;
 }
 
-// ASCENT: coast phase. Exit on apogee — altitude decreasing for 5 consecutive
-// samples (~250 ms), or APOGEE_TIMEOUT_MS hard timeout. Mach lockout
-// suppresses baro detection above MACH_LOCKOUT_VELOCITY (transonic shock
-// noise on the LPS22). Decreasing-altitude check is also gated by
-// APOGEE_MIN_ALTITUDE so a low-altitude motor failure can't fire the pyro.
+// Apogee is five falling-altitude samples, or the hard timeout.
 static int apogeeConfirmCount = 0;
 static const int APOGEE_CONFIRM_THRESHOLD = 5;
 
 static States handleAscent(float altitude) {
   statusIndicator.solid(StatusIndicator::RED);
-
-  // max_altitude is now tracked centrally in updateFlightMaxima (called
-  // every tick by the loop functions), so it climbs from the moment
-  // altitude leaves the pad-pinned 0 regime — i.e. as soon as IGNITION
-  // fires, not only once we reach ASCENT.
 
   bool machLockout = FlightState.velocity > MACH_LOCKOUT_VELOCITY;
   bool altDecreasing = !machLockout && (altitude < FlightState.prev_altitude) && (altitude > APOGEE_MIN_ALTITUDE);
@@ -141,9 +106,7 @@ static States handleAscent(float altitude) {
   return States::ASCENT;
 }
 
-// APOGEE: drive the apogee charge for IGNITER_FIRE_DURATION_MS, then move on.
-// fire() is gated on isArmed() — defense in depth for handleIdle's gate, and
-// allows a mid-flight DISARM to abort the pyro.
+// Local pyro path. For the current launch, another board owns pyro events.
 static States handleApogee() {
   statusIndicator.solid(StatusIndicator::RED);
 
@@ -157,8 +120,7 @@ static States handleApogee() {
   return States::APOGEE;
 }
 
-// DESCENT: under the recovery system. Exit when altitude drops below the
-// landing threshold (close enough to ground level that we're definitely down).
+// Landed when filtered altitude is back near pad level.
 static States handleDescent(float altitude) {
   statusIndicator.solid(StatusIndicator::BLUE);
 
@@ -169,14 +131,12 @@ static States handleDescent(float altitude) {
   return States::DESCENT;
 }
 
-// LANDED: terminal. LED green, no further transitions.
 static States handleLanded() {
   statusIndicator.solid(StatusIndicator::GREEN);
   return States::LANDED;
 }
 
-// Clears file-static debounce counters. Called by SOFT_RESET so a reset issued
-// mid-flight doesn't carry stale burnout/apogee tallies into the next attempt.
+// Reset debounce counters for SOFT_RESET.
 void resetStateMachineCounters() {
   burnoutConfirmCount = 0;
   apogeeConfirmCount = 0;

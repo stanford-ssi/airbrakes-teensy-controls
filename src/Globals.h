@@ -7,10 +7,7 @@
 #include <peripherals/Igniter.h>
 #include <peripherals/StatusIndicator.h>
 
-// Latest sensor frame, written by readRealSensors() / readSimulatedSensors()
-// every loop tick. accel_*_high_g come from the ADXL375 (±200 g, dominates
-// during motor burn); accel_x/y/z come from the ADXL345 (±16 g, dominates
-// at low g). pressure/temperature drive the AGL altitude derivation.
+// Latest sensor frame from real hardware or SHITL.
 struct SensorData_t {
   float accel_x, accel_y, accel_z;
   float accel_x_high_g, accel_y_high_g, accel_z_high_g;
@@ -20,15 +17,7 @@ struct SensorData_t {
   uint16_t potentiometer_value;
 };
 
-// Brake actuator state (commanded position + sweep bookkeeping).
-//   pct: airbrake-% [0..100], 0 = retracted. driveServos() also updates this.
-//   direction / last_update: AIRBRAKE_TEST and fallback-sweep step state.
-//   fallback_sweep_count: completed 0→max→0 cycles in runFallbackSweep().
-//     Capped at FALLBACK_SWEEP_COUNT — beyond that we hold retracted rather
-//     than sweeping forever, since the same I2C failure that kicked us into
-//     fallback could be a brake-actuator fault we don't want to keep poking.
-//   hasCheckedForHorizontal: latched after the first IDLE tick to avoid
-//     re-running the orientation check after the rocket leaves the pad.
+// Brake command and sweep bookkeeping.
 struct BrakeState_t {
   float pct = 0.0f;
   int direction = 1;
@@ -37,9 +26,7 @@ struct BrakeState_t {
   bool hasCheckedForHorizontal = false;
 };
 
-// Per-flight scalar state. Times are millis() snapshots; max_* are running
-// peaks surfaced in telemetry so a dashboard reconnecting after landing
-// sees the apogee and peak g/velocity without a separate query.
+// Per-flight timing, estimator, and peak telemetry values.
 struct FlightState_t {
   unsigned long ignition_time = 0;
   unsigned long motor_burnout_time = 0;
@@ -49,16 +36,25 @@ struct FlightState_t {
   float velocity = 0.0f;  // m/s, signed (positive = up)
   float max_velocity = 0.0f;
   float max_accel_g = 0.0f;
+  // Fallback-target ladder state. The flight loop runs `as normal` (controller
+  // targeting primary 30k) until the rocket reaches FALLBACK_ARM_ALT_AGL_M
+  // (20k ft AGL), at which point evaluateFallbackTarget() picks one of three
+  // tiers based on the live `apo_no_brakes from current state`. See main.cpp
+  // for the safety reasoning.
+  //
+  //   fallback_decision_made: set once the gate fires. Prevents re-eval.
+  //   fallback_tier: 1 = primary 30k (no change), 2 = 28.5k, 3 = 26k.
+  //                  Defaults to 1 so pre-decision telemetry shows primary.
+  //   fallback_apo_at_decision_m: apo_no_brakes value the decision used.
+  bool fallback_decision_made = false;
+  int fallback_tier = 1;
+  float fallback_apo_at_decision_m = 0.0f;
 };
 
-// I2C link state to the control Teensy (apogee predictor + servo controller).
-//   cmd_servo_*, predicted_apogee, cd_add_cmd: returned every tick.
-//   target_cd_raw / apo_no_brakes / apo_max_brakes: predictor diagnostics.
-//   fallback / failCount: tripped after I2C_FAIL_THRESHOLD consecutive
-//     transmission failures; runFallbackSweep() takes over once latched.
+// Optional two-Teensy controller state and diagnostics.
 struct I2CControl_t {
   unsigned long lastSend = 0;
-  bool fallback = false;
+  bool fallback = false;          // I2C link fallback (unrelated to target fallback)
   int failCount = 0;
   float cmd_servo_1 = 0.0f;
   float cmd_servo_2 = 0.0f;
@@ -67,6 +63,11 @@ struct I2CControl_t {
   float target_cd_raw = 0.0f;
   float apo_no_brakes = 0.0f;
   float apo_max_brakes = 0.0f;
+  // Mirror of AirbrakeController::targetAltitude() so the dashboard / SD log
+  // can see when the fallback-target latch fires (value drops from primary
+  // 9144 m to fallback 8686.8 m). Defaults to primary so pre-launch frames
+  // show the right value.
+  float active_target_alt = 9144.0f;
 };
 
 extern SensorData_t sensors;
@@ -81,16 +82,11 @@ extern Igniter primaryIgniter;
 
 void sendControlPacket(float altitude);
 
-// Drives both servos to `pct`. Suppresses physical motion in SHITL_DEMO but
-// still updates BrakeState.pct so telemetry/charts read correctly.
+// Drive both servos, or telemetry only in SHITL_DEMO.
 void driveServos(float pct);
 
-// True in SHITL / SHITL_DEMO. The state machine checks this before HW-arming
-// the apogee igniter so a simulated accel/altitude profile can't fire a real
-// pyro on the bench.
+// True when local pyro outputs must stay inhibited.
 bool shouldInhibitPyros();
 
-// True only after an explicit ARM command from the dashboard. Sticky: only
-// DISARM, a mode switch, or a power cycle clears it. The state machine gates
-// the apogee pyro on this. See memory/feedback_arm_is_sticky.
+// Sticky dashboard ARM state.
 bool isArmed();

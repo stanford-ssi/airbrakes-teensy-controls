@@ -19,8 +19,36 @@ namespace RocketConfig {
     constexpr float MAX_CD = BODY_CD + MAX_CD_ADD;
 
     // Target altitude
-    constexpr float TARGET_ALT_AGL_M = 9144.0f;  // 30,000 ft
+    constexpr float TARGET_ALT_AGL_M = 9144.0f;  // 30,000 ft (primary)
     constexpr float MAX_TARGET_ALT_M = 9144.0f;  // 30,000 ft (IREC max)
+
+    // ── Fallback target ladder ───────────────────────────────────────
+    // The controller flies as normal at TARGET_ALT_AGL_M until the rocket
+    // reaches FALLBACK_ARM_ALT_AGL_M (20k ft AGL), at which point a single
+    // 3-way tier selection fires based on `apo_no_brakes from current state`:
+    //
+    //   tier 1 (GO):   apo_no_brakes ≥ TARGET_ALT_AGL_M − margin
+    //                  → keep primary 30k target
+    //   tier 2:        FALLBACK_TARGET_ALT_AGL_M − margin
+    //                  ≤ apo_no_brakes < TARGET_ALT_AGL_M − margin
+    //                  → lower target to 28.5k (still reach a useful apogee)
+    //   tier 3:        apo_no_brakes < FALLBACK_TARGET_ALT_AGL_M − margin
+    //                  → lower target to 26k so brakes still have headroom
+    //                  to actuate even on a deeply underperforming flight
+    //
+    // The check is intrinsically safe for nominal flights: the controller's
+    // predictor only commands brakes when apo_no_brakes ≥ target (its
+    // explicit early-return), so a flight on track for primary cannot read
+    // below the tier 1 threshold at the gate. The ladder effectively only
+    // fires for flights where the controller's predictor said cd_add=0
+    // throughout coast — i.e. genuine underperformance.
+    //
+    // One-shot decision; once a tier is selected, no hysteresis or
+    // re-evaluation. Margins absorb predictor noise at each boundary.
+    constexpr float FALLBACK_TARGET_ALT_AGL_M      = 8686.8f;  // 28,500 ft (tier 2)
+    constexpr float FALLBACK_DEEP_TARGET_ALT_AGL_M = 7924.8f;  // 26,000 ft (tier 3)
+    constexpr float FALLBACK_ARM_ALT_AGL_M         = 6096.0f;  // 20,000 ft AGL
+    constexpr float FALLBACK_TRIGGER_MARGIN_M      = 200.0f;   // ~656 ft
 
     // Launch site — FAR (Mojave), matches Airbrakes_SHITL and new-collins-airbrakes.
     constexpr float LAUNCH_SITE_ALT_MSL_M = 630.9f; // 2070 ft × 0.3048
