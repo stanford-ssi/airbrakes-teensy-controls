@@ -7,7 +7,7 @@
 
 // Fixed-size CSV row builder; avoids heap use in the flight loop.
 struct LogBuffer {
-  char data[256];
+  char data[512];
   int pos = 0;
 
   void appendStr(const char *s) {

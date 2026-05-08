@@ -10,7 +10,7 @@ static States handleSensorError() {
   return States::SENSOR_ERROR;
 }
 
-// IDLE waits for launch. A horizontal boot enters the bench sweep instead.
+// IDLE waits for launch.
 static States handleIdle() {
   statusIndicator.solid(StatusIndicator::GREEN);
 
@@ -21,17 +21,6 @@ static States handleIdle() {
       primaryIgniter.arm();
     }
     return States::IGNITION;
-  }
-
-  if (!BrakeState.hasCheckedForHorizontal) {
-    if (abs(sensors.accel_x) > abs(sensors.accel_z) ||
-        abs(sensors.accel_y) > abs(sensors.accel_z)) {
-      BrakeState.direction = 1;
-      BrakeState.last_update = 0;
-      BrakeState.pct = AIRBRAKE_MIN;
-      return States::AIRBRAKE_TEST;
-    }
-    BrakeState.hasCheckedForHorizontal = true;
   }
 
   return States::IDLE;

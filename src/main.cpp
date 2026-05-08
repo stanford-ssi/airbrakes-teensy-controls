@@ -398,11 +398,9 @@ static void restartStateMachine() {
     simCalibrated = false;
     simCalibrationCount = 0;
     simCalibrationTotalCount = 0;
-    BrakeState.hasCheckedForHorizontal = true;
     state = States::IDLE;
   } else {
     bool cal_ok = calibrateSensors(lps22, &adxl345, &adxl375);
-    BrakeState.hasCheckedForHorizontal = false;
     if (!cal_ok) {
       failed_sensors++;
       state = States::SENSOR_ERROR;
@@ -418,7 +416,6 @@ static void restartStateMachine() {
 static void enterSHITL(TeensyMode target) {
   currentMode = target;
   comm.setTimeout(25);  // SHITL frames arrive within a few ms
-  BrakeState.hasCheckedForHorizontal = true;
   simCalibrated = false;
   simCalibrationCount = 0;
   simCalibrationTotalCount = 0;
@@ -664,7 +661,7 @@ static void handleSerialCommand(const char *line) {
       comm.print(size);
       comm.println();
 
-      char outbuf[300];
+      char outbuf[512];
       static const char prefix[] = "SD_LINE,";
       constexpr size_t prefix_len = sizeof(prefix) - 1;  // 8
       memcpy(outbuf, prefix, prefix_len);
@@ -989,39 +986,57 @@ static void evaluateFallbackTarget(float altitude) {
   FlightState.fallback_decision_made = true;
   FlightState.fallback_apo_at_decision_m = apo_no_brakes;
 
+  // Each threshold = (that tier's target) − margin. apo above the threshold
+  // means the next-higher tier still has headroom for brakes to actuate
+  // toward its target. Fall through to the lowest tier as a catchall so a
+  // deeply-underperforming flight still gets a sensibly-logged target.
   const float threshold_primary =
       RocketConfig::TARGET_ALT_AGL_M - RocketConfig::FALLBACK_TRIGGER_MARGIN_M;
-  const float threshold_fallback =
+  const float threshold_t2 =
       RocketConfig::FALLBACK_TARGET_ALT_AGL_M - RocketConfig::FALLBACK_TRIGGER_MARGIN_M;
+  const float threshold_t3 =
+      RocketConfig::FALLBACK_DEEP_TARGET_ALT_AGL_M - RocketConfig::FALLBACK_TRIGGER_MARGIN_M;
+  const float threshold_t4 =
+      RocketConfig::FALLBACK_DEEPER_TARGET_ALT_AGL_M - RocketConfig::FALLBACK_TRIGGER_MARGIN_M;
 
-  // Pick a tier. tier=1 keeps the controller at primary; tier=2 and tier=3
-  // call setTargetAltitude with the next-lower target so the controller's
-  // predictor and over-target gate both honour the new ceiling.
+  // Pick a tier. tier=1 keeps the controller at primary; tier 2-5 call
+  // setTargetAltitude with their target so the controller's predictor and
+  // over-target gate both honour the new ceiling.
   int tier;
   float new_target;
   if (apo_no_brakes >= threshold_primary) {
     tier = 1;
     new_target = RocketConfig::TARGET_ALT_AGL_M;
     // No setTargetAltitude call — controller already at primary by default.
-  } else if (apo_no_brakes >= threshold_fallback) {
+  } else if (apo_no_brakes >= threshold_t2) {
     tier = 2;
     new_target = RocketConfig::FALLBACK_TARGET_ALT_AGL_M;
     airbrakeController.setTargetAltitude(new_target);
-  } else {
+  } else if (apo_no_brakes >= threshold_t3) {
     tier = 3;
     new_target = RocketConfig::FALLBACK_DEEP_TARGET_ALT_AGL_M;
     airbrakeController.setTargetAltitude(new_target);
+  } else if (apo_no_brakes >= threshold_t4) {
+    tier = 4;
+    new_target = RocketConfig::FALLBACK_DEEPER_TARGET_ALT_AGL_M;
+    airbrakeController.setTargetAltitude(new_target);
+  } else {
+    tier = 5;
+    new_target = RocketConfig::FALLBACK_DEEPEST_TARGET_ALT_AGL_M;
+    airbrakeController.setTargetAltitude(new_target);
   }
   FlightState.fallback_tier = tier;
+  I2CControl.active_target_alt = new_target;
 
-  char marker[200];
+  char marker[240];
   snprintf(marker, sizeof(marker),
            "# FALLBACK_DECISION at millis=%lu alt=%.1fm "
            "apo_no_brakes=%.1fm tier=%d target=%.1fm "
-           "thresholds={primary=%.1fm,fallback=%.1fm}",
+           "thresholds={primary=%.1fm,t2=%.1fm,t3=%.1fm,t4=%.1fm}",
            millis(), (double)altitude, (double)apo_no_brakes, tier,
            (double)new_target,
-           (double)threshold_primary, (double)threshold_fallback);
+           (double)threshold_primary, (double)threshold_t2,
+           (double)threshold_t3, (double)threshold_t4);
   logging.log(marker);
   logging.flush();
 }
@@ -1211,7 +1226,6 @@ void setup() {
 
   if (isSimMode(currentMode)) {
     comm.setTimeout(100);
-    BrakeState.hasCheckedForHorizontal = true;
   }
 
   if (comm.connected()) {

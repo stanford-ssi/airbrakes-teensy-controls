@@ -23,7 +23,6 @@ struct BrakeState_t {
   int direction = 1;
   unsigned long last_update = 0;
   int fallback_sweep_count = 0;
-  bool hasCheckedForHorizontal = false;
 };
 
 // Per-flight timing, estimator, and peak telemetry values.

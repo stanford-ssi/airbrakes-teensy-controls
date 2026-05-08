@@ -25,8 +25,10 @@ COLS = [
     "target_cd_raw", "apo_no_brakes", "apo_max_brakes", "armed",
     "max_altitude", "max_velocity", "max_accel_g",
     "ignition_time_ms", "apogee_time_ms",
+    "active_target_alt", "fallback_tier", "fallback_apo_at_decision_m",
 ]
-EXPECTED_FIELDS = len(COLS)  # 35
+EXPECTED_FIELDS = len(COLS)  # 38
+MIN_FIELDS = 35  # pre-fallback schema through Apogee_Time_ms
 
 
 def load(path: Path):
@@ -35,8 +37,10 @@ def load(path: Path):
         if not raw or not raw[0].isdigit():
             continue  # header fragments + any noise
         parts = raw.split(",")
-        if len(parts) < EXPECTED_FIELDS:
+        if len(parts) < MIN_FIELDS:
             continue
+        if len(parts) < EXPECTED_FIELDS:
+            parts = parts + ["nan"] * (EXPECTED_FIELDS - len(parts))
         row = {}
         for col, val in zip(COLS, parts):
             if col == "state":
@@ -93,6 +97,21 @@ def summary(rows):
     if over_thresh:
         first = over_thresh[0]
         print(f"  first crossing: t={first['time_ms']:.0f}ms az={first['az']:.2f} g state={first['state']}")
+
+    fallback_rows = [
+        r for r in rows
+        if "fallback_apo_at_decision_m" in r and r["fallback_apo_at_decision_m"] > 0
+    ]
+    if fallback_rows:
+        first = fallback_rows[0]
+        print("\nFallback target decision:")
+        print(f"  tier: {first['fallback_tier']:.0f}")
+        print(f"  active target: {first['active_target_alt']:.1f} m "
+              f"({first['active_target_alt'] * 3.28084:.0f} ft)")
+        print(f"  apo_no_brakes at decision: {first['fallback_apo_at_decision_m']:.1f} m "
+              f"({first['fallback_apo_at_decision_m'] * 3.28084:.0f} ft)")
+    elif "fallback_tier" in rows[0]:
+        print("\nFallback target decision: not latched in this log")
 
 
 def plot(rows, out_path: Path):
